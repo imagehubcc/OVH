@@ -341,12 +341,12 @@ const OVHAvailabilityPage = () => {
         <div className="flex items-start gap-3">
           <Database className="w-5 h-5 text-cyan-400 mt-0.5" />
           <div className="flex-1">
-            {isConfigLoading ? (
+            {isConfigLoading && !endpoint ? (
               <div className="flex items-center gap-2">
                 <div className="animate-spin w-4 h-4 border-2 border-cyan-400 border-t-transparent rounded-full"></div>
                 <span className="text-cyber-muted text-sm">正在加载区域配置...</span>
               </div>
-            ) : (
+            ) : endpoint ? (
               <>
                 <h3 className="font-semibold text-cyan-400 mb-2 flex items-center gap-2">
                   OVH 公开 API
@@ -375,7 +375,7 @@ const OVHAvailabilityPage = () => {
                   </div>
                 </div>
               </>
-            )}
+            ) : null}
           </div>
         </div>
       </div>

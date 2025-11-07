@@ -61,6 +61,8 @@ const QueuePage = () => {
   const [selectedDatacenters, setSelectedDatacenters] = useState<string[]>([]);
   const [retryInterval, setRetryInterval] = useState<number>(TASK_RETRY_INTERVAL);
   const [quantity, setQuantity] = useState<number>(1); // 每个数据中心的抢购数量
+  const [selectedOptions, setSelectedOptions] = useState<string[]>([]); // 选中的可选配置
+  const [optionsInput, setOptionsInput] = useState<string>(''); // 用户自定义输入
 
   // Fetch queue items
   const fetchQueueItems = async () => {
@@ -118,6 +120,7 @@ const QueuePage = () => {
             planCode: planCodeInput.trim(),
             datacenter: dc,
             retryInterval: retryInterval,
+            options: selectedOptions, // 传递可选配置参数
           });
           successCount++;
         } catch (error) {
@@ -141,6 +144,8 @@ const QueuePage = () => {
       setSelectedDatacenters([]);
       setRetryInterval(TASK_RETRY_INTERVAL);
       setQuantity(1);
+      setSelectedOptions([]);
+      setOptionsInput('');
     }
   };
 
@@ -226,10 +231,21 @@ const QueuePage = () => {
     }
   }, [planCodeInput, servers]);
 
-  // Reset selectedDatacenters when planCodeInput changes
+  // 不自动重置选项 - 用户可能只是修改了 planCode，应保留已选配置
+  
+  // 双向同步：输入框 ↔ selectedOptions
   useEffect(() => {
-    setSelectedDatacenters([]);
-  }, [planCodeInput]);
+    setOptionsInput(selectedOptions.join(', '));
+  }, [selectedOptions]);
+  
+  // 从输入框更新到数组
+  const updateOptionsFromInput = () => {
+    const options = optionsInput
+      .split(',')
+      .map(v => v.trim())
+      .filter(v => v);
+    setSelectedOptions(options);
+  };
 
   const containerVariants = {
     hidden: { opacity: 0 },
@@ -312,8 +328,8 @@ const QueuePage = () => {
           <h2 className={`${isMobile ? 'text-lg' : 'text-xl'} font-semibold mb-4 sm:mb-6 text-cyber-primary-accent pr-8`}>添加抢购任务</h2>
           
           <div className="grid grid-cols-1 lg:grid-cols-3 gap-4 sm:gap-6 mb-4 sm:mb-6">
-            {/* Left Column: Plan Code & Retry Interval */}
-            <div className="md:col-span-1 space-y-6">
+            {/* Left Column: Plan Code, Quantity & Retry Interval */}
+            <div className="md:col-span-1 space-y-4">
               <div>
                 <label htmlFor="planCode" className="block text-sm font-medium text-cyber-secondary mb-1">服务器计划代码</label>
                 <input
@@ -424,6 +440,77 @@ const QueuePage = () => {
                   </div>
                 ))}
               </div>
+              
+              {/* 可选配置 - 用户自定义输入 */}
+              <div className="mt-4">
+                <div className="text-xs font-medium text-cyber-secondary mb-2">
+                  ⚙️ 可选配置（自定义）
+                  <span className="text-[10px] text-cyber-muted ml-2">
+                    (留空使用默认配置，用逗号分隔多个选项)
+                  </span>
+                </div>
+                
+                <input
+                  type="text"
+                  placeholder="例如: ram-64g-ecc-2400, softraid-2x450nvme-24sk50"
+                  value={optionsInput}
+                  onChange={(e) => setOptionsInput(e.target.value)}
+                  onBlur={updateOptionsFromInput}
+                  className="w-full cyber-input bg-cyber-surface text-cyber-text border-cyber-border focus:ring-cyber-primary focus:border-cyber-primary text-xs py-1.5"
+                />
+                <div className="mt-2 p-2 bg-yellow-500/10 border border-yellow-500/30 rounded">
+                  <p className="text-[10px] text-yellow-400 leading-relaxed">
+                    ⚠️ <strong>重要提示：</strong>如您提供的可选参数不正确，系统将使用默认配置下单。请务必在
+                    <a 
+                      href="https://api.ovh.com/1.0/order/catalog/public/eco?ovhSubsidiary=IE" 
+                      target="_blank" 
+                      rel="noopener noreferrer"
+                      className="text-cyber-accent hover:text-cyber-primary underline mx-1"
+                    >
+                      OVH API 目录
+                    </a>
+                    获取准确参数。
+                  </p>
+                </div>
+                <p className="text-[10px] text-cyber-muted mt-1">
+                  💡 示例：ram-64g-ecc-2400, softraid-2x450nvme-24sk50
+                </p>
+                
+                {/* 已选配置显示 */}
+                {selectedOptions.length > 0 && (
+                  <div className="mt-2 p-1.5 bg-cyber-accent/10 border border-cyber-accent/30 rounded">
+                    <div className="flex items-center justify-between mb-1">
+                      <div className="text-[10px] font-medium text-cyber-accent">已选配置 ({selectedOptions.length})</div>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setSelectedOptions([]);
+                          setOptionsInput('');
+                        }}
+                        className="text-[10px] text-cyber-muted hover:text-cyber-accent"
+                      >
+                        清除
+                      </button>
+                    </div>
+                    <div className="flex flex-wrap gap-1">
+                      {selectedOptions.map((optValue, index) => (
+                        <div key={index} className="flex items-center gap-1 px-1.5 py-0.5 bg-cyber-accent/20 rounded text-[10px]">
+                          <span className="font-mono">{optValue}</span>
+                          <button
+                            onClick={() => {
+                              const newOptions = selectedOptions.filter((_, i) => i !== index);
+                              setSelectedOptions(newOptions);
+                            }}
+                            className="text-cyber-muted hover:text-cyber-accent"
+                          >
+                            <XIcon size={10} />
+                          </button>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+              </div>
             </div>
           </div>
 
@@ -433,9 +520,9 @@ const QueuePage = () => {
             disabled={!planCodeInput.trim() || selectedDatacenters.length === 0}
           >
             {selectedDatacenters.length > 0 && quantity > 1 
-              ? `添加到队列（将创建 ${selectedDatacenters.length * quantity} 个独立任务）`
+              ? `添加到队列（将创建 ${selectedDatacenters.length * quantity} 个独立任务${selectedOptions.length > 0 ? `，含${selectedOptions.length}个可选配置` : ''}）`
               : selectedDatacenters.length > 0 && quantity === 1
-              ? `添加到队列（${selectedDatacenters.length} 个任务）`
+              ? `添加到队列（${selectedDatacenters.length} 个任务${selectedOptions.length > 0 ? `，含${selectedOptions.length}个可选配置` : ''}）`
               : '添加到队列'
             }
           </button>
@@ -444,31 +531,32 @@ const QueuePage = () => {
 
       {/* Queue List */}
       <div>
-        {queueItems.length === 0 && (
-          <div className="text-center py-10 border border-dashed border-cyber-border rounded-lg">
-            <SearchIcon className="mx-auto text-cyber-secondary mb-2" size={32} />
-            <p className="text-cyber-secondary font-medium">队列为空</p>
-            <p className="text-xs text-cyber-muted">通过上方的表单添加新的抢购任务。</p>
-          </div>
-        )}
-
-        {queueItems.length > 0 && (
-          <div className="space-y-3">
+        <div className="space-y-3">
             {queueItems.map(item => (
               <div 
                 key={item.id}
                 className="bg-cyber-surface p-4 rounded-lg shadow-md border border-cyber-border flex flex-col sm:flex-row justify-between items-start sm:items-center gap-3"
               >
                 <div className="flex-grow">
-                  <div className="flex items-center gap-2 mb-1">
+                  <div className="flex items-center gap-2 mb-1 flex-wrap">
                     <span className="px-2 py-0.5 text-xs bg-cyber-primary-accent/20 text-cyber-primary-accent rounded-full font-mono">
                       {item.planCode}
                     </span>
                     <span className="text-sm text-cyber-text-dimmed">DC: {item.datacenter.toUpperCase()}</span>
+                    {item.options && item.options.length > 0 && (
+                      <span className="px-2 py-0.5 text-xs bg-cyber-accent/20 text-cyber-accent rounded-full">
+                        含 {item.options.length} 个可选配置
+                      </span>
+                    )}
                   </div>
                   <p className="text-xs text-cyber-muted">
                     下次尝试: {item.retryCount > 0 ? `${item.retryInterval}秒后 (第${item.retryCount + 1}次)` : `即将开始` } | 创建于: {new Date(item.createdAt).toLocaleString()}
                   </p>
+                  {item.options && item.options.length > 0 && (
+                    <p className="text-xs text-cyber-muted mt-1">
+                      📦 可选配置: {item.options.join(', ')}
+                    </p>
+                  )}
                 </div>
                 <div className="flex items-center gap-2 mt-2 sm:mt-0 flex-shrink-0">
                   <span 
@@ -503,8 +591,7 @@ const QueuePage = () => {
                 </div>
               </div>
             ))}
-          </div>
-        )}
+        </div>
       </div>
     </div>
   );
