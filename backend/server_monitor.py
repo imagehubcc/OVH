@@ -5,7 +5,7 @@
 
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 import traceback
 import uuid
 
@@ -47,6 +47,15 @@ class ServerMonitor:
         self.message_uuid_cache_ttl = 24 * 3600  # 缓存有效期：24小时（秒）
         
         self.add_log("INFO", "服务器监控器初始化完成", "monitor")
+    
+    def _now_beijing(self) -> datetime:
+        """返回北京时间（Asia/Shanghai）的当前时间。"""
+        try:
+            from zoneinfo import ZoneInfo  # Python 3.9+
+            return datetime.now(ZoneInfo("Asia/Shanghai"))
+        except Exception:
+            # 兼容无zoneinfo环境：使用UTC+8近似
+            return datetime.utcnow() + timedelta(hours=8)
     
     def add_subscription(self, plan_code, datacenters=None, notify_available=True, notify_unavailable=False, server_name=None, last_status=None, history=None, auto_order=False):
         """
@@ -276,6 +285,34 @@ class ServerMonitor:
                     available_notifications = [n for n in notifications_to_send if n["change_type"] == "available"]
                     unavailable_notifications = [n for n in notifications_to_send if n["change_type"] == "unavailable"]
                     
+                    # 在发送有货通知之前，优先尝试下单（仅当订阅开启 autoOrder）
+                    if available_notifications and subscription.get("autoOrder"):
+                        try:
+                            import requests
+                            from api_key_config import API_SECRET_KEY
+                            for notif in available_notifications:
+                                dc_to_order = notif["dc"]
+                                # 使用配置级 options（若存在），否则留空让后端自动匹配
+                                order_options = (config_info.get("options") if config_info else []) or []
+                                payload = {
+                                    "planCode": plan_code,
+                                    "datacenter": dc_to_order,
+                                    "options": order_options
+                                }
+                                headers = {"X-API-Key": API_SECRET_KEY}
+                                api_url = "http://127.0.0.1:19998/api/config-sniper/quick-order"
+                                self.add_log("INFO", f"[monitor->order] 尝试快速下单: {plan_code}@{dc_to_order}, options={order_options}", "monitor")
+                                try:
+                                    resp = requests.post(api_url, json=payload, headers=headers, timeout=30)
+                                    if resp.status_code == 200:
+                                        self.add_log("INFO", f"[monitor->order] 快速下单成功: {plan_code}@{dc_to_order}", "monitor")
+                                    else:
+                                        self.add_log("WARNING", f"[monitor->order] 快速下单失败({resp.status_code}): {resp.text}", "monitor")
+                                except requests.exceptions.RequestException as e:
+                                    self.add_log("WARNING", f"[monitor->order] 快速下单请求异常: {str(e)}", "monitor")
+                        except Exception as e:
+                            self.add_log("WARNING", f"[monitor->order] 下单前置流程异常: {str(e)}", "monitor")
+                    
                     # 发送有货通知（汇总所有有货的机房到一个通知，带按钮）
                     if available_notifications:
                         config_desc = f" [{config_info['display']}]" if config_info else ""
@@ -299,7 +336,7 @@ class ServerMonitor:
                         
                         for notif in available_notifications:
                             history_entry = {
-                                "timestamp": datetime.now().isoformat(),
+                                "timestamp": self._now_beijing().isoformat(),
                                 "datacenter": notif["dc"],
                                 "status": notif["status"],
                                 "changeType": notif["change_type"],
@@ -325,7 +362,7 @@ class ServerMonitor:
                             subscription["history"] = []
                         
                         history_entry = {
-                            "timestamp": datetime.now().isoformat(),
+                            "timestamp": self._now_beijing().isoformat(),
                             "datacenter": notif["dc"],
                             "status": notif["status"],
                             "changeType": notif["change_type"],
@@ -413,14 +450,73 @@ class ServerMonitor:
             self.add_log("INFO", f"准备发送提醒: {plan_code}@{dc}{config_desc} - {change_type}", "monitor")
             # 获取服务器名称
             server_name = subscription.get("serverName")
-            self.send_availability_alert(plan_code, dc, status, change_type, config_info, server_name)
+
+            # 如果是“有货 -> 无货”，计算本次有货持续时长
+            duration_text = None
+            if change_type == "unavailable":
+                try:
+                    last_available_ts = None
+                    same_config_display = config_info.get("display") if config_info else None
+                    # 从后向前查找最近一次相同机房（且相同配置显示文本时更精确）的 available 记录
+                    for entry in reversed(subscription.get("history", [])):
+                        if entry.get("datacenter") != dc:
+                            continue
+                        if entry.get("changeType") != "available":
+                            continue
+                        if same_config_display:
+                            cfg = entry.get("config", {})
+                            if cfg.get("display") != same_config_display:
+                                continue
+                        last_available_ts = entry.get("timestamp")
+                        if last_available_ts:
+                            break
+                    if last_available_ts:
+                        try:
+                            # 解析ISO时间，按北京时间计算时长（兼容无时区与带时区）
+                            from datetime import datetime as _dt
+                            try:
+                                # 优先解析为带时区
+                                start_dt = _dt.fromisoformat(last_available_ts.replace("Z", "+00:00"))
+                            except Exception:
+                                start_dt = _dt.fromisoformat(last_available_ts)
+                            # 若解析为naive时间，视为北京时间
+                            if start_dt.tzinfo is None:
+                                try:
+                                    from zoneinfo import ZoneInfo
+                                    start_dt = start_dt.replace(tzinfo=ZoneInfo("Asia/Shanghai"))
+                                except Exception:
+                                    # 退化：将其视为UTC+8
+                                    start_dt = start_dt
+                            delta = self._now_beijing() - start_dt
+                            total_sec = int(delta.total_seconds())
+                            if total_sec < 0:
+                                total_sec = 0
+                            days = total_sec // 86400
+                            rem = total_sec % 86400
+                            hours = rem // 3600
+                            minutes = (rem % 3600) // 60
+                            seconds = rem % 60
+                            if days > 0:
+                                duration_text = f"历时 {days}天{hours}小时{minutes}分{seconds}秒"
+                            elif hours > 0:
+                                duration_text = f"历时 {hours}小时{minutes}分{seconds}秒"
+                            elif minutes > 0:
+                                duration_text = f"历时 {minutes}分{seconds}秒"
+                            else:
+                                duration_text = f"历时 {seconds}秒"
+                        except Exception:
+                            duration_text = None
+                except Exception:
+                    duration_text = None
+
+            self.send_availability_alert(plan_code, dc, status, change_type, config_info, server_name, duration_text=duration_text)
             
             # 添加到历史记录
             if "history" not in subscription:
                 subscription["history"] = []
             
             history_entry = {
-                "timestamp": datetime.now().isoformat(),
+                "timestamp": self._now_beijing().isoformat(),
                 "datacenter": dc,
                 "status": status,
                 "changeType": change_type,
@@ -496,7 +592,7 @@ class ServerMonitor:
                 dc_display = dc_display_map.get(dc.lower(), dc.upper())
                 message += f"  • {dc_display} ({dc.upper()})\n"
             
-            message += f"\n⏰ 时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+            message += f"\n⏰ 时间: {self._now_beijing().strftime('%Y-%m-%d %H:%M:%S')}"
             message += f"\n\n💡 点击下方按钮可直接下单对应机房！"
             
             # 构建内联键盘按钮（每个机房一个按钮，最多每行2个按钮）
@@ -591,7 +687,7 @@ class ServerMonitor:
             import traceback
             self.add_log("ERROR", f"错误详情: {traceback.format_exc()}", "monitor")
     
-    def send_availability_alert(self, plan_code, datacenter, status, change_type, config_info=None, server_name=None):
+    def send_availability_alert(self, plan_code, datacenter, status, change_type, config_info=None, server_name=None, duration_text=None):
         """
         发送可用性变化提醒
         
@@ -677,7 +773,7 @@ class ServerMonitor:
                 
                 message += (
                     f"状态: {status}\n"
-                    f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+                    f"时间: {self._now_beijing().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
                     f"💡 快去抢购吧！"
                 )
             else:
@@ -699,8 +795,11 @@ class ServerMonitor:
                 
                 message += (
                     f"状态: 已无货\n"
-                    f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+                    f"时间: {self._now_beijing().strftime('%Y-%m-%d %H:%M:%S')}"
                 )
+                # 若可用，追加“从有货到无货历时多久”
+                if duration_text:
+                    message += f"\n{duration_text}"
             
             config_desc = f" [{config_info['display']}]" if config_info else ""
             self.add_log("INFO", f"正在发送Telegram通知: {plan_code}@{datacenter}{config_desc}", "monitor")
@@ -898,7 +997,7 @@ class ServerMonitor:
                 f"内存: {server.get('memory', 'N/A')}\n"
                 f"存储: {server.get('storage', 'N/A')}\n"
                 f"带宽: {server.get('bandwidth', 'N/A')}\n"
-                f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+                f"时间: {self._now_beijing().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
                 f"💡 快去查看详情！"
             )
             
