@@ -471,6 +471,12 @@ const MonitorPage = () => {
                   <p className="text-xs text-cyber-muted mt-1">
                     💡 设置数量后，有货时会立即按数量下单，不受同机房2分钟限制
                   </p>
+                  {formData.autoOrderQuantity > 0 && (
+                    <p className="text-xs text-yellow-500 mt-1 flex items-start">
+                      <span className="mr-1">⚠️</span>
+                      <span>如设置了自动下单数量，请不要清理抢购队列和抢购历史记录，避免重复下单</span>
+                    </p>
+                  )}
                 </div>
               )}
               <div className="flex gap-3">
@@ -550,6 +556,12 @@ const MonitorPage = () => {
                         </span>
                       )}
                     </div>
+                    {sub.autoOrder && sub.autoOrderQuantity > 0 && (
+                      <p className="text-xs text-yellow-500 mt-2 flex items-start">
+                        <span className="mr-1">⚠️</span>
+                        <span>如设置了自动下单数量，请不要清理抢购队列和抢购历史记录，避免重复下单</span>
+                      </p>
+                    )}
                   </div>
                   
                   <div className="flex gap-2">

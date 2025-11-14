@@ -214,18 +214,22 @@ class ServerMonitor:
                         change_type = None
                         
                         # ✅ 如果开启了自动下单，且 old_status 是 None，但 status 不是 unavailable
-                        # 需要检查是否已经下过单（通过检查 lastStatus 中是否有其他状态键）
+                        # 需要检查是否已经下过单（通过检查 lastStatus 中是否有相同配置的其他机房状态）
                         # 这样可以避免在持续有货的情况下，因为状态键不匹配而重复触发
+                        # 但要注意：不能跳过同一检查循环中的其他机房，只跳过之前已经下过单的配置
                         if old_status is None and status != "unavailable" and subscription.get("autoOrder"):
-                            # 检查是否有其他状态键存在（说明不是真正的首次检查）
-                            has_other_status = any(
-                                key != status_key and value != "unavailable" 
+                            # 检查是否有相同配置（config_key）的其他机房已经下过单
+                            # 只检查相同配置的其他机房，避免跳过同一检查循环中的其他机房
+                            has_same_config_status = any(
+                                key != status_key and 
+                                key.endswith(f"|{config_key}") and  # 相同配置的其他机房
+                                value != "unavailable" 
                                 for key, value in last_status.items()
                             )
-                            if has_other_status:
+                            if has_same_config_status:
                                 # 不是真正的首次检查，可能是状态键不匹配
                                 # 不触发状态变化，避免重复下单
-                                self.add_log("WARNING", f"[状态检测] {status_key}: 检测到状态键不匹配（old_status=None但存在其他状态），跳过触发，避免重复下单", "monitor")
+                                self.add_log("WARNING", f"[状态检测] {status_key}: 检测到相同配置的其他机房已下过单（old_status=None但存在相同配置状态），跳过触发，避免重复下单", "monitor")
                                 # 直接更新状态，不触发通知和下单
                                 # 注意：状态会在检查循环末尾统一更新，这里不需要手动更新
                                 continue
@@ -268,6 +272,9 @@ class ServerMonitor:
                                 "status_key": status_key,
                                 "change_type": change_type
                             })
+                            # ✅ 添加调试日志，查看有多少个机房被添加到通知列表
+                            if change_type == "available":
+                                self.add_log("DEBUG", f"[状态检测] 添加有货通知: {plan_code}@{dc} (状态: {status}, old_status: {old_status})", "monitor")
                     
                     # 对于同一个配置，只查询一次价格（使用第一个有货的数据中心）
                     price_text = None
@@ -368,6 +375,10 @@ class ServerMonitor:
                 # 按change_type分组发送通知（汇总同一配置的所有有货机房）
                 available_notifications = [n for n in notifications_to_send if n["change_type"] == "available"]
                 unavailable_notifications = [n for n in notifications_to_send if n["change_type"] == "unavailable"]
+                
+                # ✅ 添加调试日志，查看有多少个机房有货
+                if available_notifications:
+                    self.add_log("INFO", f"[monitor->order] 检测到 {len(available_notifications)} 个机房有货: {[n['dc'] for n in available_notifications]}", "monitor")
                 
                 # 自动下单仅在配置了 autoOrder 时执行
                 if available_notifications and subscription.get("autoOrder"):
