@@ -81,18 +81,11 @@ CONFIG_SNIPER_FILE = os.path.join(DATA_DIR, "config_sniper_tasks.json")
 VPS_SUBSCRIPTIONS_FILE = os.path.join(DATA_DIR, "vps_subscriptions.json")
 
 config = {
-    "appKey": "",
-    "appSecret": "",
-    "consumerKey": "",
-    "endpoint": "ovh-eu",
     "tgToken": "",
     "tgChatId": "",
-    "iam": "go-ovh-ie",
-    "zone": "IE",
 }
 
 accounts = {}
-default_account_id = None
 
 logs = []
 queue = []
@@ -144,7 +137,7 @@ executor = ThreadPoolExecutor(max_workers=3)
 
 # Load data from files if they exist
 def load_data():
-    global config, logs, queue, purchase_history, server_plans, stats, config_sniper_tasks, vps_subscriptions, vps_check_interval, accounts, default_account_id
+    global config, logs, queue, purchase_history, server_plans, stats, config_sniper_tasks, vps_subscriptions, vps_check_interval, accounts
     
     if os.path.exists(CONFIG_FILE):
         try:
@@ -161,44 +154,8 @@ def load_data():
                     accounts = {a.get("id"): a for a in accs if a and a.get("id")}
                 elif isinstance(accs, dict):
                     accounts = accs
-                # 清理旧字段：移除每个账户中的 tgToken / tgChatId（统一使用全局配置）
-                try:
-                    changed = False
-                    for k, v in list(accounts.items()):
-                        if isinstance(v, dict):
-                            before = (v.get('tgToken'), v.get('tgChatId'))
-                            v.pop('tgToken', None)
-                            v.pop('tgChatId', None)
-                            after = (v.get('tgToken'), v.get('tgChatId'))
-                            if before != after:
-                                changed = True
-                    if changed:
-                        # 回写清理后的文件
-                        save_accounts()
-                        print("已清理accounts文件中的Telegram字段，改为使用全局配置")
-                except Exception as e:
-                    print(f"清理账户字段失败: {e}")
         except Exception as e:
             print(f"警告: {ACCOUNTS_FILE}文件读取失败: {e}")
-
-    if (not accounts) and (config.get("appKey") and config.get("appSecret") and config.get("consumerKey")):
-        aid = "default"
-        accounts[aid] = {
-            "id": aid,
-            "alias": "默认账户",
-            "appKey": config.get("appKey"),
-            "appSecret": config.get("appSecret"),
-            "consumerKey": config.get("consumerKey"),
-            "endpoint": config.get("endpoint", "ovh-eu"),
-            "zone": config.get("zone", "IE")
-        }
-        try:
-            payload = {"accounts": list(accounts.values())}
-            with open(ACCOUNTS_FILE, 'w', encoding='utf-8') as f:
-                json.dump(payload, f, ensure_ascii=False, indent=2)
-            print("已从config迁移创建默认账户")
-        except Exception as e:
-            print(f"迁移保存账户失败: {e}")
     
     if os.path.exists(LOGS_FILE):
         try:
@@ -465,10 +422,9 @@ def save_data(do_flush=True):
                 acc_queue_map.setdefault(aid, []).append(item)
             acc_ids = set(accounts.keys())
             acc_ids.update(acc_queue_map.keys())
-            acc_ids.add(None)
             for aid in acc_ids:
                 items = acc_queue_map.get(aid, [])
-                path = os.path.join(DATA_DIR, f"queue_{aid or 'default'}.json")
+                path = os.path.join(DATA_DIR, f"queue_{aid}.json")
                 with open(path, 'w', encoding='utf-8') as f:
                     json.dump(items, f, ensure_ascii=False, indent=2)
             acc_hist_map = {}
@@ -477,10 +433,9 @@ def save_data(do_flush=True):
                 acc_hist_map.setdefault(aid, []).append(h)
             acc_ids_h = set(accounts.keys())
             acc_ids_h.update(acc_hist_map.keys())
-            acc_ids_h.add(None)
             for aid in acc_ids_h:
                 items = acc_hist_map.get(aid, [])
-                path = os.path.join(DATA_DIR, f"history_{aid or 'default'}.json")
+                path = os.path.join(DATA_DIR, f"history_{aid}.json")
                 with open(path, 'w', encoding='utf-8') as f:
                     json.dump(items, f, ensure_ascii=False, indent=2)
         except Exception as e:
@@ -1604,7 +1559,7 @@ def load_server_list():
                     dc["dcName"] = "华沙"
                     dc["region"] = "波兰"
                 elif dc_code == "fra":
-                    dc["dcName"] = "法兰克福"
+                    dc["dcName"] = "林堡"
                     dc["region"] = "德国"
                 elif dc_code == "lon":
                     dc["dcName"] = "伦敦"
@@ -2617,27 +2572,10 @@ def save_settings():
     prev_tg_chat_id = config.get("tgChatId")
 
     # 仅更新提供的字段，未提供的字段保持原值
-    if data.get("appKey") is not None:
-        config["appKey"] = data.get("appKey")
-    if data.get("appSecret") is not None:
-        config["appSecret"] = data.get("appSecret")
-    if data.get("consumerKey") is not None:
-        config["consumerKey"] = data.get("consumerKey")
-    if data.get("endpoint") is not None:
-        config["endpoint"] = data.get("endpoint") or "ovh-eu"
     if data.get("tgToken") is not None:
         config["tgToken"] = data.get("tgToken")
     if data.get("tgChatId") is not None:
         config["tgChatId"] = data.get("tgChatId")
-    if data.get("iam") is not None:
-        config["iam"] = data.get("iam")
-    if data.get("zone") is not None:
-        config["zone"] = data.get("zone") or "IE"
-
-    # 自动生成 IAM（当为空时）
-    if not config.get("iam"):
-        zone_val = (config.get("zone") or "IE").lower()
-        config["iam"] = f"go-ovh-{zone_val}"
 
     save_data()
     add_log("INFO", "API 设置已更新并写入 config.json")

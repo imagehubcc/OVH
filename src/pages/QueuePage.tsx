@@ -1121,7 +1121,6 @@ const QueuePage = () => {
                       )}
                     </div>
                     <div className="flex items-center gap-2 mt-2 sm:mt-0 flex-shrink-0">
-                      <span className="text-xs px-2 py-1 rounded-full font-medium bg-blue-500/20 text-blue-400">已完成</span>
                       <span className="px-1.5 py-0.5 text-[10px] font-mono bg-cyber-grid/10 text-cyber-text border border-cyber-accent/30 rounded-md">账户：{getAccountLabel(item.accountId)}</span>
                       {(() => {
                         const zone = getAccountZone(item.accountId);
@@ -1132,6 +1131,7 @@ const QueuePage = () => {
                           </span>
                         );
                       })()}
+                      <span className="text-xs px-2 py-1 rounded-full font-medium bg-blue-500/20 text-blue-400">已完成</span>
                       <button 
                         onClick={async () => { await api.put(`/queue/${item.id}/restart`); toast.success('已重新开始任务，并清空计数'); fetchQueueItems(true); }}
                         className="p-1.5 hover:bg-cyber-hover rounded text-cyber-secondary hover:text-green-400 transition-colors"
@@ -1224,7 +1224,6 @@ const QueuePage = () => {
                       )}
                     </div>
                     <div className="flex items-center gap-2 mt-2 sm:mt-0 flex-shrink-0">
-                      <span className="text-xs px-2 py-1 rounded-full font-medium bg-yellow-500/20 text-yellow-400">已暂停</span>
                       <span className="px-1.5 py-0.5 text-[10px] font-mono bg-cyber-grid/10 text-cyber-text border border-cyber-accent/30 rounded-md">账户：{getAccountLabel(item.accountId)}</span>
                       {(() => {
                         const zone = getAccountZone(item.accountId);
@@ -1235,6 +1234,7 @@ const QueuePage = () => {
                           </span>
                         );
                       })()}
+                      <span className="text-xs px-2 py-1 rounded-full font-medium bg-yellow-500/20 text-yellow-400">已暂停</span>
                       <button 
                         onClick={() => toggleQueueItemStatus(item.id, item.status)}
                         className="p-1.5 hover:bg-cyber-hover rounded text-cyber-secondary hover:text-cyber-primary transition-colors"

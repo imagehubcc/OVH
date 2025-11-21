@@ -80,6 +80,7 @@ const APIAccountsPage = () => {
       if (res.data?.success) {
         toast.success("账户已保存");
         await refreshAccounts();
+        try { await setCurrentAccount(idVal); } catch {}
         resetForm();
       } else {
         const msg = res.data?.error || "保存失败";
