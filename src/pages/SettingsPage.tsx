@@ -332,7 +332,7 @@ const SettingsPage = () => {
 
               {/* SSH 公钥（全局） */}
               <div className="cyber-grid-line pt-4">
-                <h2 className="text-xl font-bold mb-3">SSH 公钥（全局）</h2>
+                <h2 className="text-xl font-bold mb-4">全局 SSH公钥 (可选)</h2>
                 <p className="text-xs text-cyber-muted mb-2">为所有账户的Linux系统安装统一预置SSH免密登录公钥</p>
                 <textarea
                   name="sshKey"
@@ -345,7 +345,7 @@ const SettingsPage = () => {
               </div>
               
               <div className="cyber-grid-line pt-4">
-                <h2 className="text-xl font-bold mb-4">Telegram 通知设置 (可选)</h2>
+                <h2 className="text-xl font-bold mb-4">📱 Telegram 通知设置 (可选)</h2>
                 
                 <div className="space-y-4">
                   <div>
@@ -397,7 +397,7 @@ const SettingsPage = () => {
 
                   {/* Telegram Webhook 设置 */}
                   <div className="cyber-grid-line pt-4 mt-4">
-                    <h3 className="text-lg font-semibold mb-3">📱 Telegram Webhook 设置</h3>
+                    <h3 className="text-lg font-semibold mb-3">📱 Telegram Webhook 设置 (可选)</h3>
                     <p className="text-xs text-cyber-muted mb-4">
                       设置 Webhook 后，当服务器有货时可以在 Telegram 中直接点击按钮加入抢购队列
                     </p>

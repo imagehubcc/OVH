@@ -20,6 +20,7 @@
 import { useEffect, useState } from "react";
 import { api } from "@/utils/apiClient";
 import { toast } from "sonner";
+import { apiEvents } from "@/context/APIContext";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
@@ -33,7 +34,9 @@ import {
   AlertCircle,
   Mail,
   Inbox,
-  Clock
+  Clock,
+  ChevronLeft,
+  ChevronRight
 } from "lucide-react";
 
 interface AccountInfo {
@@ -90,6 +93,9 @@ const AccountManagementPage = () => {
     refunds: false,
     emails: false
   });
+  const [emailPage, setEmailPage] = useState<number>(1);
+  const [emailPagination, setEmailPagination] = useState<{ page: number; page_size: number; total: number; total_pages: number; has_next: boolean; has_prev: boolean } | null>(null);
+  const [jumpPageInput, setJumpPageInput] = useState<string>("");
 
   // 获取账户信息
   // API: GET /api/ovh/account/info -> OVH API: GET /me
@@ -140,16 +146,24 @@ const AccountManagementPage = () => {
   // 获取邮件历史
   // API: GET /api/ovh/account/email-history -> OVH API: GET /me/notification/email/history + GET /me/notification/email/history/{id}
   // 返回 OVH 发送的邮件通知列表，包含邮件主题、正文、时间等信息
-  const fetchEmailHistory = async () => {
+  const fetchEmailHistory = async (page?: number) => {
     setLoading(prev => ({ ...prev, emails: true }));
     try {
-      const response = await api.get('/ovh/account/email-history');
+      const response = await api.get('/ovh/account/email-history', { params: { page: page ?? 1 } });
       if (response.data.status === 'success') {
-        // 按日期降序排序
-        const sortedEmails = response.data.data.sort((a: EmailHistory, b: EmailHistory) => {
-          return new Date(b.date).getTime() - new Date(a.date).getTime();
-        });
-        setEmails(sortedEmails);
+        const list: EmailHistory[] = response.data.data || [];
+        setEmails(list);
+        const p = response.data.pagination;
+        if (p) {
+          setEmailPagination(p);
+          setEmailPage(p.page);
+          setJumpPageInput(String(p.page));
+        } else {
+          setEmailPagination(null);
+          setEmailPage(page ?? 1);
+          setJumpPageInput(String(page ?? 1));
+        }
+        setSelectedEmail(null);
       }
     } catch (error: any) {
       toast.error('获取邮件历史失败: ' + (error.response?.data?.message || error.message));
@@ -221,7 +235,21 @@ const AccountManagementPage = () => {
   useEffect(() => {
     fetchAccountInfo();
     fetchRefunds();
-    fetchEmailHistory();
+    fetchEmailHistory(1);
+  }, []);
+
+  // 监听账户切换，轻量级刷新当前页面的数据
+  useEffect(() => {
+    const unsubscribe = apiEvents.onAuthChanged(async () => {
+      try {
+        await fetchAccountInfo();
+        await fetchRefunds();
+        await fetchEmailHistory(1);
+        setSelectedEmail(null);
+        toast.success('已切换账户，账户信息已刷新');
+      } catch {}
+    });
+    return () => { unsubscribe(); };
   }, []);
 
   return (
@@ -321,19 +349,46 @@ const AccountManagementPage = () => {
               <CardHeader>
                 <CardTitle className="flex items-center justify-between">
                   <span>邮件列表</span>
-                  <button 
-                    onClick={fetchEmailHistory}
-                    className="cyber-button text-xs flex items-center gap-2"
-                  >
-                    <RefreshCw className="w-4 h-4" />
-                    <span>刷新</span>
-                  </button>
+                  <div className="flex items-center gap-2">
+                    <button
+                      onClick={() => fetchEmailHistory(emailPage)}
+                      className="cyber-button text-xs flex items-center gap-2"
+                    >
+                      <RefreshCw className="w-4 h-4" />
+                      <span>刷新</span>
+                    </button>
+                    <div className="flex items-center gap-2">
+                      <button
+                        onClick={() => emailPagination?.has_prev && fetchEmailHistory((emailPage || 1) - 1)}
+                        disabled={!emailPagination?.has_prev}
+                        className="cyber-button text-xs flex items-center gap-1"
+                        title="上一页"
+                      >
+                        <ChevronLeft className="w-4 h-4" />
+                        <span>上一页</span>
+                      </button>
+                      {emailPagination && (
+                        <span className="text-xs text-cyber-muted whitespace-nowrap">
+                          第 {emailPagination.page}/{emailPagination.total_pages} 页（共 {emailPagination.total} 封）
+                        </span>
+                      )}
+                      <button
+                        onClick={() => emailPagination?.has_next && fetchEmailHistory((emailPage || 1) + 1)}
+                        disabled={!emailPagination?.has_next}
+                        className="cyber-button text-xs flex items-center gap-1"
+                        title="下一页"
+                      >
+                        <span>下一页</span>
+                        <ChevronRight className="w-4 h-4" />
+                      </button>
+                    </div>
+                  </div>
                 </CardTitle>
                 <CardDescription>OVH 发送给您的邮件通知</CardDescription>
               </CardHeader>
               <CardContent>
                 {emails.length > 0 ? (
-                  <div className="space-y-2 max-h-[600px] overflow-y-auto pr-2">
+                  <div className="space-y-2 pr-2">
                     {emails.map((email) => (
                       <div
                         key={email.id}
@@ -361,6 +416,34 @@ const AccountManagementPage = () => {
                         </div>
                       </div>
                     ))}
+                    {emailPagination && emailPagination.total_pages > 1 && (
+                      <div className="flex items-center justify-between pt-3">
+                        <span className="text-xs text-cyber-muted">
+                          第 {emailPagination.page}/{emailPagination.total_pages} 页（共 {emailPagination.total} 封）
+                        </span>
+                        <div className="flex items-center gap-2">
+                          <input
+                            type="number"
+                            min={1}
+                            max={emailPagination.total_pages}
+                            value={jumpPageInput}
+                            onChange={(e) => setJumpPageInput(e.target.value)}
+                            className="cyber-input w-24 text-xs"
+                            placeholder="页码"
+                          />
+                          <button
+                            onClick={() => {
+                              const n = parseInt(jumpPageInput, 10);
+                              const target = isNaN(n) ? emailPagination.page : Math.max(1, Math.min(emailPagination.total_pages, n));
+                              fetchEmailHistory(target);
+                            }}
+                            className="cyber-button text-xs"
+                          >
+                            跳转
+                          </button>
+                        </div>
+                      </div>
+                    )}
                   </div>
                 ) : hasLoaded.emails && !loading.emails && emails.length === 0 ? (
                   <div className="text-center py-8 text-cyber-muted">
@@ -601,4 +684,3 @@ const AccountManagementPage = () => {
 };
 
 export default AccountManagementPage;
-

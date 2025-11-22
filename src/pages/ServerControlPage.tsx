@@ -172,6 +172,7 @@ const ServerControlPage: React.FC = () => {
   const [servers, setServers] = useState<ServerInfo[]>([]);
   const [isLoading, setIsLoading] = useState(true);
   const [isRefreshing, setIsRefreshing] = useState(false); // 区分初始加载和刷新
+  const clearedToastShownRef = useRef(false);
   
   // Task 3: 重装系统状态
   const [selectedServer, setSelectedServer] = useState<ServerInfo | null>(null);
@@ -440,7 +441,7 @@ const ServerControlPage: React.FC = () => {
   };
 
   // Task 1: 获取服务器列表（只显示活跃服务器）
-  const fetchServers = async (isRefresh = false) => {
+  const fetchServers = async (isRefresh = false): Promise<any[]> => {
     // 如果是刷新，只设置刷新状态，不改变加载状态
     if (isRefresh) {
       setIsRefreshing(true);
@@ -479,10 +480,12 @@ const ServerControlPage: React.FC = () => {
                    (filteredCount > 0 ? ` (已过滤 ${filteredCount} 台)` : '')
           });
         }
+        return activeServers;
       }
     } catch (error: any) {
       console.error('获取服务器列表失败:', error);
       showToast({ type: 'error', title: '获取服务器列表失败' });
+      return [];
     } finally {
       setIsLoading(false);
       setIsRefreshing(false);
@@ -2088,16 +2091,31 @@ const ServerControlPage: React.FC = () => {
   useEffect(() => {
     const unsubscribe = apiEvents.onAuthChanged(async (newAuthState) => {
       try {
-        await fetchServers(true);
-        if (selectedServer) {
+        const refreshed = await fetchServers(true);
+        // 如果当前选择的服务器不在新列表中，清空选择以避免串号
+        if (selectedServer && !refreshed.some(s => s.serviceName === selectedServer.serviceName)) {
+          setSelectedServer(null as any);
+          if (!clearedToastShownRef.current) {
+            clearedToastShownRef.current = true;
+            showToast({ type: 'warning', title: '当前选择的服务器不属于该账户，已清空选择' });
+          }
+        }
+        // 若当前未选择且有列表，自动选择第一台
+        if (!selectedServer && refreshed.length > 0) {
+          setSelectedServer(refreshed[0]);
+        }
+        const svr = selectedServer && refreshed.some(s => s.serviceName === selectedServer.serviceName)
+          ? selectedServer
+          : (refreshed[0] || null);
+        if (svr) {
           await Promise.all([
-            fetchMonitoring(selectedServer.serviceName),
-            fetchHardware(selectedServer.serviceName),
-            fetchIPs(selectedServer.serviceName),
-            fetchServiceInfo(selectedServer.serviceName),
-            fetchInterventions(selectedServer.serviceName),
-            fetchNetworkInterfaces(selectedServer.serviceName),
-            fetchMrtgData(selectedServer.serviceName)
+            fetchMonitoring(svr.serviceName),
+            fetchHardware(svr.serviceName),
+            fetchIPs(svr.serviceName),
+            fetchServiceInfo(svr.serviceName),
+            fetchInterventions(svr.serviceName),
+            fetchNetworkInterfaces(svr.serviceName),
+            fetchMrtgData(svr.serviceName)
           ]);
         }
       } catch {}

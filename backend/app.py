@@ -4526,7 +4526,8 @@ def find_matching_api2_plans(config_fingerprint, target_plancode_base=None, excl
         return []
     
     try:
-        catalog = client.get(f"/order/catalog/public/eco?ovhSubsidiary={zone}")
+        zone_cfg = get_current_account_config()
+        catalog = client.get(f"/order/catalog/public/eco?ovhSubsidiary={zone_cfg['zone']}")
         matched_plancodes = []
         
         # 配置匹配模式：查找所有相同配置的型号
@@ -6356,7 +6357,21 @@ def get_service_info(service_name):
             }
         })
     except Exception as e:
-        add_log("ERROR", f"获取服务器 {service_name} 服务信息失败: {str(e)}", "server_control")
+        # 尝试提取 OVH Query ID，辅助排查跨账户访问引起的 "service does not exist"
+        qid = None
+        try:
+            resp = getattr(e, 'httpResponse', None)
+            if resp:
+                qid = resp.headers.get('OVH-Query-ID') or resp.headers.get('X-Ovh-QueryID')
+        except Exception:
+            pass
+        msg = str(e)
+        if qid:
+            msg = f"{msg} OVH-Query-ID: {qid}"
+        add_log("ERROR", f"获取服务器 {service_name} 服务信息失败: {msg}", "server_control")
+        # 当服务不存在时返回 404，避免前端收到 500 和空响应
+        status_code = 404 if 'does not exist' in str(e).lower() else 500
+        return jsonify({"success": False, "error": msg}), status_code
 
 # ==============================================
 # 变更联系人 API（Change Contact）
@@ -9063,26 +9078,55 @@ def get_email_history():
         return jsonify({"status": "error", "message": "未配置OVH API"}), 400
     
     try:
+        # 获取分页参数
+        page_param = request.args.get('page', '1')
+        try:
+            page = int(page_param)
+        except Exception:
+            page = 1
+        if page < 1:
+            page = 1
+
+        page_size = 8
+
         # 获取邮件ID列表
         email_ids = client.get('/me/notification/email/history')
-        
-        # 反转列表，获取最新的邮件（ID通常是递增的，所以反转后最新的在前）
+
+        # 倒序，最新在前
         email_ids = list(reversed(email_ids))
-        
-        # 获取每封邮件的详细信息
+
+        total = len(email_ids)
+        total_pages = (total + page_size - 1) // page_size if total > 0 else 1
+
+        start_index = (page - 1) * page_size
+        end_index = start_index + page_size
+
+        # 越界处理
+        if start_index >= total:
+            sliced_ids = []
+        else:
+            sliced_ids = email_ids[start_index:end_index]
+
         emails = []
-        # 限制最多获取50封邮件，避免请求过多
-        for email_id in email_ids[:50]:
+        for email_id in sliced_ids:
             try:
                 email_detail = client.get(f'/me/notification/email/history/{email_id}')
                 emails.append(email_detail)
             except Exception as e:
                 add_log("WARNING", f"获取邮件 {email_id} 详情失败: {str(e)}", "account_management")
-        
-        add_log("INFO", f"成功获取 {len(emails)} 封邮件（总共 {len(email_ids)} 封）", "account_management")
+
+        add_log("INFO", f"成功获取第 {page}/{total_pages} 页，共 {len(emails)} 封（总计 {total} 封）", "account_management")
         return jsonify({
             "status": "success",
-            "data": emails
+            "data": emails,
+            "pagination": {
+                "page": page,
+                "page_size": page_size,
+                "total": total,
+                "total_pages": total_pages,
+                "has_next": page < total_pages,
+                "has_prev": page > 1
+            }
         })
     except Exception as e:
         add_log("ERROR", f"获取邮件历史失败: {str(e)}", "account_management")
