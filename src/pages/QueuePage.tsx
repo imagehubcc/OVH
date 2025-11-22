@@ -4,9 +4,10 @@ import { motion, AnimatePresence } from "framer-motion";
 import { useAPI } from "@/context/APIContext";
 import { api } from "@/utils/apiClient";
 import { toast } from "sonner";
-import { XIcon, RefreshCwIcon, PlusIcon, SearchIcon, PlayIcon, PauseIcon, Trash2Icon, ArrowUpDownIcon, HeartIcon, Settings, Cpu, Database, HardDrive, Wifi, ArrowRightLeft, CheckSquare, Check, ShoppingCart } from 'lucide-react';
+import { XIcon, RefreshCwIcon, PlusIcon, SearchIcon, PlayIcon, PauseIcon, Trash2Icon, ArrowUpDownIcon, HeartIcon, Settings, Cpu, Database, HardDrive, Wifi, ArrowRightLeft, CheckSquare, Check, ShoppingCart, CreditCard } from 'lucide-react';
 import { useIsMobile } from "@/hooks/use-mobile";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { Switch } from "@/components/ui/switch";
 import { Card, CardHeader, CardTitle, CardContent } from "@/components/ui/card";
 import { 
   API_URL, 
@@ -33,6 +34,7 @@ interface QueueItem {
   purchased?: number;
   failureCount?: number;
   nextAttemptAt?: number;
+  auto_pay?: boolean;
 }
 
 interface ServerOption {
@@ -82,8 +84,9 @@ const QueuePage = () => {
   const [quantity, setQuantity] = useState<number>(1);
   const [selectedOptions, setSelectedOptions] = useState<string[]>([]); // 选中的可选配置
   const [optionsInput, setOptionsInput] = useState<string>(''); // 用户自定义输入
+  const [autoPay, setAutoPay] = useState<boolean>(false);
+  const [planCodeDebounced, setPlanCodeDebounced] = useState<string>("");
   const [showClearConfirm, setShowClearConfirm] = useState(false); // 清空确认对话框
-  const [isGettingConfig, setIsGettingConfig] = useState(false);
   const [editingItemId, setEditingItemId] = useState<string | null>(null);
   const [runningItems, setRunningItems] = useState<QueueItem[]>([]);
   const [completedItems, setCompletedItems] = useState<QueueItem[]>([]);
@@ -187,6 +190,7 @@ const QueuePage = () => {
         retryInterval: retryInterval,
         options: selectedOptions,
         quantity: quantity,
+        auto_pay: autoPay,
       });
       toast.success(`已创建抢购任务，目标 ${quantity} 台`);
       fetchQueueItems(true);
@@ -196,6 +200,7 @@ const QueuePage = () => {
       setQuantity(1);
       setSelectedOptions([]);
       setOptionsInput('');
+      setAutoPay(false);
     } catch (error) {
       console.error(`Error adding ${planCodeInput.trim()} to queue:`, error);
       toast.error("添加到队列失败");
@@ -210,6 +215,7 @@ const QueuePage = () => {
     setQuantity(Math.min(Math.max(item.quantity || 1, 1), 100));
     setSelectedOptions(Array.isArray(item.options) ? item.options : []);
     setOptionsInput((Array.isArray(item.options) ? item.options : []).join(', '));
+    setAutoPay(!!item.auto_pay);
     setTimeout(() => {
       if (Array.isArray(item.datacenters)) {
         setSelectedDatacenters(item.datacenters);
@@ -235,6 +241,7 @@ const QueuePage = () => {
         retryInterval,
         options: selectedOptions,
         quantity,
+        auto_pay: autoPay,
       });
       toast.success('队列已更新');
       setEditingItemId(null);
@@ -351,10 +358,17 @@ const QueuePage = () => {
     })();
   }, [pausedPage, pageSize]);
 
+  useEffect(() => {
+    const t = setTimeout(() => {
+      setPlanCodeDebounced(planCodeInput.trim());
+    }, 300);
+    return () => clearTimeout(t);
+  }, [planCodeInput]);
+
   // Update selectedServer and visible datacenters when planCodeInput or servers list changes
   useEffect(() => {
-    if (planCodeInput.trim()) {
-      const server = servers.find(s => s.planCode === planCodeInput.trim());
+    if (planCodeDebounced) {
+      const server = servers.find(s => s.planCode === planCodeDebounced);
       setSelectedServer(server || null);
       if (server && Array.isArray(server.datacenters)) {
         const dcList = server.datacenters
@@ -365,12 +379,49 @@ const QueuePage = () => {
         const filtered = dcList.filter(dc => validDcs.includes(dc));
         const uniqueFiltered = Array.from(new Set(filtered));
         setVisibleDatacenters(uniqueFiltered);
+        setSelectedDatacenters([]);
+        const defaults = (server.defaultOptions || []).map(o => o.value);
+        if (defaults.length > 0) {
+          setSelectedOptions(prev => {
+            const set = new Set([...prev, ...defaults]);
+            return Array.from(set);
+          });
+        } else {
+          setSelectedOptions([]);
+        }
+        setOptionsInput('');
       } else {
         setVisibleDatacenters([]);
+        setSelectedDatacenters([]);
+        setSelectedOptions([]);
+        setOptionsInput('');
+        if (isAuthenticated) {
+          (async () => {
+            try {
+              const refreshed = await fetchServers(true);
+              const srv = refreshed.find(s => s.planCode === planCodeDebounced);
+              if (srv && Array.isArray(srv.datacenters)) {
+                const dcList = srv.datacenters
+                  .map(d => d.datacenter?.toLowerCase())
+                  .map(d => (d === 'ynm' ? 'mum' : d))
+                  .filter(Boolean) as string[];
+                const validDcs = OVH_DATACENTERS.map(dc => dc.code);
+                const filtered = dcList.filter(dc => validDcs.includes(dc));
+                const uniqueFiltered = Array.from(new Set(filtered));
+                setVisibleDatacenters(uniqueFiltered);
+                setSelectedDatacenters([]);
+                const defaults = (srv.defaultOptions || []).map(o => o.value);
+                if (defaults.length > 0) {
+                  setSelectedOptions(prev => {
+                    const set = new Set([...prev, ...defaults]);
+                    return Array.from(set);
+                  });
+                }
+              }
+            } catch {}
+          })();
+        }
       }
-      setSelectedDatacenters([]);
-      setSelectedOptions([]);
-      setOptionsInput('');
     } else {
       setSelectedServer(null);
       setVisibleDatacenters([]);
@@ -378,7 +429,7 @@ const QueuePage = () => {
       setSelectedOptions([]);
       setOptionsInput('');
     }
-  }, [planCodeInput, servers]);
+  }, [planCodeDebounced, servers, isAuthenticated]);
 
   // 不自动重置选项 - 用户可能只是修改了 planCode，应保留已选配置
   
@@ -658,64 +709,7 @@ const QueuePage = () => {
                     placeholder="例如: 24sk202"
                     className="flex-1 cyber-input bg-cyber-surface text-cyber-text border-cyber-border focus:ring-cyber-primary focus:border-cyber-primary"
                   />
-                  <button
-                    type="button"
-                    onClick={async () => {
-                      setIsGettingConfig(true);
-                      if (!planCodeInput.trim()) {
-                        toast.error("请输入计划代码");
-                        setIsGettingConfig(false);
-                        return;
-                      }
-                      let server = servers.find(s => s.planCode === planCodeInput.trim());
-                      if (!server) {
-                        if (!isAuthenticated) {
-                          toast.error("未在缓存中找到该计划，且未认证，无法从OVH获取");
-                          setIsGettingConfig(false);
-                          return;
-                        }
-                        const refreshed = await fetchServers(true);
-                        server = refreshed.find(s => s.planCode === planCodeInput.trim()) || null;
-                        if (!server) {
-                          toast.error("未从OVH获取到该计划");
-                          setIsGettingConfig(false);
-                          return;
-                        }
-                      }
-                      const dcList = (server.datacenters || [])
-                        .map(d => d.datacenter?.toLowerCase())
-                        .map(d => (d === 'ynm' ? 'mum' : d))
-                        .filter(Boolean);
-                      const validDcs = OVH_DATACENTERS.map(dc => dc.code);
-                      const filtered = dcList.filter(dc => validDcs.includes(dc));
-                      const uniqueFiltered = Array.from(new Set(filtered));
-                      if (uniqueFiltered.length === 0) {
-                        toast.warning("该计划未提供可用机房信息");
-                      }
-                      setVisibleDatacenters(uniqueFiltered);
-                      setSelectedDatacenters([]);
-                      const defaults = (server.defaultOptions || []).map(o => o.value);
-                      if (defaults.length > 0) {
-                        setSelectedOptions(prev => {
-                          const set = new Set([...prev, ...defaults]);
-                          return Array.from(set);
-                        });
-                      }
-                      toast.success("已获取配置");
-                      setIsGettingConfig(false);
-                    }}
-                    className="cyber-button text-xs whitespace-nowrap disabled:opacity-40 disabled:cursor-not-allowed"
-                    disabled={isGettingConfig}
-                  >
-                    {isGettingConfig ? (
-                      <span className="flex items-center">
-                        <RefreshCwIcon size={12} className="mr-1 animate-spin" />
-                        获取中
-                      </span>
-                    ) : (
-                      '获取配置'
-                    )}
-                  </button>
+                  
                 </div>
               </div>
               <div className="md:w-[220px]">
@@ -762,6 +756,13 @@ const QueuePage = () => {
                 {retryInterval <= 0 && (
                   <p className="text-xs text-red-400 mt-1">⚠️ 重试间隔必须大于 0</p>
                 )}
+              </div>
+              <div className="md:w-[180px]">
+                <label className="block text-sm font-medium text-cyber-secondary mb-1">自动支付</label>
+                <div className="flex items-center justify-between bg-cyber-grid/10 border border-cyber-accent/30 rounded-md px-3 py-2">
+                  <span className="text-xs text-cyber-muted">使用首选支付方式</span>
+                  <Switch checked={autoPay} onCheckedChange={setAutoPay} />
+                </div>
               </div>
             </div>
 
@@ -962,6 +963,7 @@ const QueuePage = () => {
                     <div className="flex-grow">
                       <div className="flex items-center gap-2 mb-1 flex-wrap">
                         <span className="px-1.5 py-0.5 text-[10px] font-mono rounded-md bg-cyber-grid/10 text-cyber-text border border-cyber-accent/30">{item.planCode}</span>
+                        
                         {(() => {
                           const s = servers.find(ss => ss.planCode === item.planCode);
                           const name = s?.name;
@@ -990,6 +992,11 @@ const QueuePage = () => {
                         <span className="px-1.5 py-0.5 text-[10px] font-mono rounded-md bg-cyber-grid/10 text-cyber-text border border-cyber-accent/30 flex items-center gap-1">
                           <ShoppingCart size={12} /> {Math.min(item.purchased || 0, item.quantity || 0)} / {item.quantity || 0}
                         </span>
+                        {item.auto_pay && (
+                          <span className="px-1.5 py-0.5 h-[18px] text-[10px] font-mono rounded-md bg-cyber-grid/10 text-cyber-text border border-cyber-accent/30 flex items-center justify-center gap-1 leading-none" title="自动支付">
+                            <CreditCard size={12} className="text-cyber-text" />
+                          </span>
+                        )}
                       </div>
                       <p className="text-xs text-cyber-muted">
                         {(() => {
@@ -1086,6 +1093,7 @@ const QueuePage = () => {
                     <div className="flex-grow">
                       <div className="flex items-center gap-2 mb-1 flex-wrap">
                         <span className="px-1.5 py-0.5 text-[10px] font-mono rounded-md bg-cyber-grid/10 text-cyber-text border border-cyber-accent/30">{item.planCode}</span>
+                        
                         {(() => {
                           const s = servers.find(ss => ss.planCode === item.planCode);
                           const name = s?.name;
@@ -1114,6 +1122,11 @@ const QueuePage = () => {
                         <span className="px-1.5 py-0.5 text-[10px] font-mono rounded-md bg-cyber-grid/10 text-cyber-text border border-cyber-accent/30 flex items-center gap-1">
                           <ShoppingCart size={12} /> {Math.min(item.purchased || 0, item.quantity || 0)} / {item.quantity || 0}
                         </span>
+                        {item.auto_pay && (
+                          <span className="px-1.5 py-0.5 h-[18px] text-[10px] font-mono rounded-md bg-cyber-grid/10 text-cyber-text border border-cyber-accent/30 flex items-center justify-center gap-1 leading-none" title="自动支付">
+                            <CreditCard size={12} className="text-cyber-text" />
+                          </span>
+                        )}
                       </div>
                       <p className="text-xs text-cyber-muted">状态: 已完成 | 创建于: {new Date(item.createdAt || Date.now()).toLocaleString()}</p>
                       {Array.isArray(item.options) && item.options.length > 0 && (
@@ -1189,6 +1202,7 @@ const QueuePage = () => {
                     <div className="flex-grow">
                       <div className="flex items-center gap-2 mb-1 flex-wrap">
                         <span className="px-1.5 py-0.5 text-[10px] font-mono rounded-md bg-cyber-grid/10 text-cyber-text border border-cyber-accent/30">{item.planCode}</span>
+                        
                         {(() => {
                           const s = servers.find(ss => ss.planCode === item.planCode);
                           const name = s?.name;
@@ -1217,6 +1231,11 @@ const QueuePage = () => {
                         <span className="px-1.5 py-0.5 text-[10px] font-mono rounded-md bg-cyber-grid/10 text-cyber-text border border-cyber-accent/30 flex items-center gap-1">
                           <ShoppingCart size={12} /> {Math.min(item.purchased || 0, item.quantity || 0)} / {item.quantity || 0}
                         </span>
+                        {item.auto_pay && (
+                          <span className="px-1.5 py-0.5 h-[18px] text-[10px] font-mono rounded-md bg-cyber-grid/10 text-cyber-text border border-cyber-accent/30 flex items-center justify-center gap-1 leading-none" title="自动支付">
+                            <CreditCard size={12} className="text-cyber-text" />
+                          </span>
+                        )}
                       </div>
                       <p className="text-xs text-cyber-muted">状态: 已暂停 | 创建于: {new Date(item.createdAt || Date.now()).toLocaleString()}</p>
                       {Array.isArray(item.options) && item.options.length > 0 && (

@@ -953,130 +953,167 @@ def check_server_availability(plan_code, options=None):
         return None
 # Purchase server
 def purchase_server(queue_item):
-    client = get_ovh_client(queue_item.get("accountId"))
+    # 单个抢购任务的下单入口：支持单次下单与并发下单（雨露均沾），并在并发前进行一次预读取以共享区域与选项信息
+    client = get_ovh_client(queue_item.get("accountId"))  # 获取指定账户的OVH客户端
     if not client:
         return False
-    helper = get_global_helper(client, max_calls_per_second=5)
-    
-    cart_id = None # Initialize cart_id to None
-    item_id = None # Initialize item_id to None
+    helper = get_global_helper(client, max_calls_per_second=5)  # 使用带重试与限速的API帮助器
 
-    # 每次加入购物车固定 1 台
-    quantity = 1
-    auto_pay = queue_item.get("auto_pay", False)
-    
+    cart_id = None  # 预读取阶段使用的购物车ID（非并发线程用）
+    item_id = None  # 预读取阶段添加的基础商品ID
+    quantity = 1  # 固定每次加入购物车数量为1
+    auto_pay = queue_item.get("auto_pay", False)  # 是否自动支付
+    # 计算剩余待购买数量（考虑已有成功数），用于并发分配
+    remaining_to_buy = max(0, int(queue_item.get("quantity", 1)) - int(queue_item.get("purchased", 0)))
+
+    def _norm_mem(v):
+        # 规范化内存配置键（去掉后缀，仅保留前两个段）
+        return '-'.join(str(v).split('-')[:2]) if v else None
+
+    def _match_cfg(mem_opt, sto_opt, item_mem, item_sto):
+        # 判断用户选项与API项的内存/存储是否匹配
+        if mem_opt:
+            if not item_mem:
+                return False
+            if _norm_mem(mem_opt) != _norm_mem(item_mem):
+                return False
+        if sto_opt:
+            if not item_sto:
+                return False
+            if not str(sto_opt).startswith(str(item_sto)):
+                return False
+        return True
+
+    def _find_dc(sorted_dcs, cfgs):
+        # 在匹配的配置下，按优先顺序找到第一个有货的机房
+        for display_dc in sorted_dcs:
+            api_dc = _convert_display_dc_to_api_dc(display_dc)
+            for cfg in cfgs:
+                for dc_info in cfg.get("datacenters", []):
+                    if dc_info.get("datacenter") == api_dc and dc_info.get("availability") not in ["unavailable", "unknown"]:
+                        return api_dc, display_dc
+        return None, None
+
+    def _infer_region(dc):
+        # 根据机房前缀推断区域（europe/canada/usa/apac），用于必需配置
+        dc = (dc or "").lower()
+        mapping = {
+            "gra": "europe", "rbx": "europe", "sbg": "europe", "eri": "europe", "lim": "europe", "waw": "europe", "par": "europe", "fra": "europe", "lon": "europe",
+            "bhs": "canada",
+            "vin": "usa", "hil": "usa",
+            "syd": "apac", "sgp": "apac", "ynm": "apac"
+        }
+        for k, v in mapping.items():
+            if dc.startswith(k):
+                return v
+        return None
+
+    def _extract_price(cart_summary):
+        # 从购物车summary中安全提取价格信息（含税/不含税/税额/货币）
+        if not isinstance(cart_summary, dict):
+            return None
+        prices = cart_summary.get("prices")
+        if not isinstance(prices, dict):
+            return None
+        wt = prices.get("withTax")
+        wot = prices.get("withoutTax")
+        tax = prices.get("tax")
+        cc = None
+        if isinstance(wt, dict):
+            cc = wt.get("currencyCode")
+        if not cc:
+            cc = prices.get("currencyCode", "EUR")
+        val_wt = wt.get("value") if isinstance(wt, dict) else wt
+        val_wot = wot.get("value") if isinstance(wot, dict) else wot
+        val_tax = tax.get("value") if isinstance(tax, dict) else tax
+        if val_wt is None and val_wot is None:
+            return None
+        return {"withTax": val_wt, "withoutTax": val_wot, "tax": val_tax, "currencyCode": cc}
+
+    def _append_history(queue_item, status, dc_display, order_id, order_url, error_msg, price_info, sequence_idx=None):
+        # 统一追加抢购历史（成功或失败），不覆盖以往记录
+        entry = {
+            "id": str(uuid.uuid4()),
+            "taskId": queue_item["id"],
+            "planCode": queue_item["planCode"],
+            "datacenter": dc_display,
+            "options": queue_item.get("options", []),
+            "status": status,
+            "orderId": order_id,
+            "orderUrl": order_url,
+            "errorMessage": error_msg,
+            "purchaseTime": datetime.now().isoformat(),
+            "attemptCount": queue_item["retryCount"],
+            "accountId": queue_item.get("accountId")
+        }
+        if status == "success":
+            entry["sequence"] = sequence_idx if sequence_idx is not None else int(queue_item.get("purchased", 0)) + 1
+        if price_info:
+            entry["price"] = price_info
+        purchase_history.append(entry)
+
     try:
-        # Check availability with multi-DC and priority weights
-        # 构建目标机房列表
-        target_dcs = queue_item.get("datacenters")
-
-        # 直接使用列表顺序作为优先级（靠前优先）
+        target_dcs = queue_item.get("datacenters")  # 用户设置的机房优先级序列（靠前优先）
         sorted_target_dcs = target_dcs[:]
-
         add_log("INFO", f"开始为 {queue_item['planCode']} 在 {','.join(sorted_target_dcs)} 的购买流程（按顺序优先）", "purchase")
 
-        availabilities = helper.get('/dedicated/server/datacenter/availabilities', planCode=queue_item["planCode"])
-        options = queue_item.get("options") or []
+        availabilities = helper.get('/dedicated/server/datacenter/availabilities', planCode=queue_item["planCode"]) 
+        options = queue_item.get("options") or []  # 用户请求的硬件选项
         matched_config = None
         if options:
-            memory_option = None
-            storage_option = None
+            mem_opt = None  # 内存选项
+            sto_opt = None  # 存储选项
             for opt in options:
                 o = str(opt).lower()
                 if 'ram-' in o or 'memory' in o:
-                    memory_option = opt
+                    mem_opt = opt
                 elif 'softraid-' in o or 'hybrid' in o or 'disk' in o or 'nvme' in o or 'raid' in o:
-                    storage_option = opt
+                    sto_opt = opt
             for item in availabilities:
-                item_memory = item.get("memory")
-                item_storage = item.get("storage")
-                memory_match = True
-                if memory_option:
-                    if item_memory:
-                        user_memory_key = '-'.join(str(memory_option).split('-')[:2])
-                        ovh_memory_key = '-'.join(str(item_memory).split('-')[:2])
-                        memory_match = (user_memory_key == ovh_memory_key)
-                    else:
-                        memory_match = False
-                else:
-                    memory_match = True
-                storage_match = True
-                if storage_option:
-                    if item_storage:
-                        storage_match = str(storage_option).startswith(str(item_storage))
-                    else:
-                        storage_match = False
-                else:
-                    storage_match = True
-                if memory_match and storage_match:
+                if _match_cfg(mem_opt, sto_opt, item.get("memory"), item.get("storage")):
                     matched_config = item
                     break
             if not matched_config:
                 add_log("INFO", f"未找到与选项匹配的配置: {options}", "purchase")
                 return False
-        configs_to_check = [matched_config] if matched_config else ([availabilities[0]] if availabilities else [])
-        found_available = False
-        selected_api_dc = None
-        selected_display_dc = None
-        # 仅在匹配到的配置中检查机房可用性
-        for display_dc in sorted_target_dcs:
-            api_dc = _convert_display_dc_to_api_dc(display_dc)
-            for cfg in configs_to_check:
-                for dc_info in cfg.get("datacenters", []):
-                    if dc_info.get("datacenter") == api_dc and dc_info.get("availability") not in ["unavailable", "unknown"]:
-                        found_available = True
-                        selected_api_dc = api_dc
-                        selected_display_dc = display_dc
-                        break
-                if found_available:
-                    break
-            if found_available:
-                break
-
-        if not found_available:
+        configs_to_check = [matched_config] if matched_config else ([availabilities[0]] if availabilities else [])  # 待检查的配置集合
+        selected_api_dc, selected_display_dc = _find_dc(sorted_target_dcs, configs_to_check)
+        if not selected_api_dc:
             add_log("INFO", f"服务器 {queue_item['planCode']} 在数据中心 {','.join(sorted_target_dcs)} 当前无货", "purchase")
             return False
-        
-        # Create cart
-        zone_cfg = get_current_account_config(queue_item.get("accountId"))
+
+        # 计算所有可用的目标机房（用于并发雨露均沾分配）
+        available_api_dcs = []  # 保持与sorted_target_dcs顺序一致
+        for display_dc in sorted_target_dcs:
+            api_dc = _convert_display_dc_to_api_dc(display_dc)
+            cfg = configs_to_check[0] if configs_to_check else {}
+            # 检查该机房在匹配配置下是否可售
+            ok = False
+            for dc_info in cfg.get("datacenters", []):
+                if dc_info.get("datacenter") == api_dc and dc_info.get("availability") not in ["unavailable", "unknown"]:
+                    ok = True
+                    break
+            if ok:
+                available_api_dcs.append((api_dc, display_dc))
+
+        zone_cfg = get_current_account_config(queue_item.get("accountId"))  # 获取账户区域信息（zone/alias）
         add_log("INFO", f"为账号 {zone_cfg['alias']} 创建购物车", "purchase")
-        cart_result = helper.post('/order/cart', ovhSubsidiary=zone_cfg["zone"])
-        cart_id = cart_result["cartId"]
+        cart_result = helper.post('/order/cart', ovhSubsidiary=zone_cfg["zone"]) 
+        cart_id = cart_result.get("cartId")
         add_log("INFO", f"购物车创建成功，ID: {cart_id}", "purchase")
-        
-        # Add base item to cart using /eco endpoint
+
         add_log("INFO", f"添加基础商品 {queue_item['planCode']} 到购物车 (使用 /eco)", "purchase")
-        item_payload = {
-            "planCode": queue_item["planCode"],
-            "pricingMode": "default",
-            "duration": "P1M",  # 1 month
-            "quantity": quantity
-        }
+        item_payload = {"planCode": queue_item["planCode"], "pricingMode": "default", "duration": "P1M", "quantity": quantity}
         item_result = helper.post(f'/order/cart/{cart_id}/eco', **item_payload)
-        item_id = item_result["itemId"] # This is the itemId for the base server
+        item_id = item_result.get("itemId")
         add_log("INFO", f"基础商品添加成功，项目 ID: {item_id}", "purchase")
-        
-        # Configure item (datacenter, OS, region)
+
         add_log("INFO", f"为项目 {item_id} 设置必需配置", "purchase")
-        # 转换数据中心代码（前端显示代码 → OVH API代码）
         first_dc = (queue_item.get("datacenters") or [None])[0]
         api_datacenter = selected_api_dc or _convert_display_dc_to_api_dc(first_dc)
-        dc_lower = api_datacenter.lower()
-        region = None
-        EU_DATACENTERS = ['gra', 'rbx', 'sbg', 'eri', 'lim', 'waw', 'par', 'fra', 'lon']
-        CANADA_DATACENTERS = ['bhs']
-        US_DATACENTERS = ['vin', 'hil']
-        APAC_DATACENTERS = ['syd', 'sgp', 'ynm']  # ynm是孟买的OVH API代码 
-
-        if any(dc_lower.startswith(prefix) for prefix in EU_DATACENTERS): region = "europe"
-        elif any(dc_lower.startswith(prefix) for prefix in CANADA_DATACENTERS): region = "canada"
-        elif any(dc_lower.startswith(prefix) for prefix in US_DATACENTERS): region = "usa"
-        elif any(dc_lower.startswith(prefix) for prefix in APAC_DATACENTERS): region = "apac"
-
-        configurations_to_set = {
-            "dedicated_datacenter": api_datacenter,  # 使用转换后的数据中心代码
-            "dedicated_os": "none_64.en" 
-        }
+        dc_lower = (api_datacenter or "").lower()
+        region = _infer_region(dc_lower)  # 推断区域
+        configurations_to_set = {"dedicated_datacenter": api_datacenter, "dedicated_os": "none_64.en"}
         if region:
             configurations_to_set["region"] = region
         else:
@@ -1086,68 +1123,51 @@ def purchase_server(queue_item):
                 if any(conf.get("label") == "region" and conf.get("required") for conf in required_configs_list):
                     raise Exception("必需的区域配置无法确定。")
             except Exception as rc_err:
-                 add_log("WARNING", f"获取必需配置失败或区域为必需但未确定: {rc_err}", "purchase")
+                add_log("WARNING", f"获取必需配置失败或区域为必需但未确定: {rc_err}", "purchase")
 
         for label, value in configurations_to_set.items():
-            if value is None: continue
+            if value is None:
+                continue
             add_log("INFO", f"配置项目 {item_id}: 设置必需项 {label} = {value}", "purchase")
-            helper.post(f'/order/cart/{cart_id}/item/{item_id}/configuration',
-                       label=label,
-                       value=str(value))
+            helper.post(f'/order/cart/{cart_id}/item/{item_id}/configuration', label=label, value=str(value))
             add_log("INFO", f"成功设置必需项: {label} = {value}", "purchase")
 
-        user_requested_options = queue_item.get("options", [])
+        user_requested_options = queue_item.get("options", [])  # 用户请求的硬件选项（过滤非硬件/许可证类）
         if user_requested_options:
             add_log("INFO", f"📦 处理用户请求的硬件选项（{len(user_requested_options)}个）: {user_requested_options}", "purchase")
-            filtered_hardware_options = []
+            filtered = []
             for option_plan_code in user_requested_options:
                 if not option_plan_code or not isinstance(option_plan_code, str):
                     add_log("WARNING", f"跳过无效的选项值: {option_plan_code}", "purchase")
                     continue
                 opt_lower = option_plan_code.lower()
-                if any(skip_term in opt_lower for skip_term in [
-                    "windows-server", "sql-server", "cpanel-license", "plesk-",
-                    "-license-", "os-", "control-panel", "panel", "license", "security"
-                ]):
+                if any(s in opt_lower for s in ["windows-server", "sql-server", "cpanel-license", "plesk-", "-license-", "os-", "control-panel", "panel", "license", "security"]):
                     add_log("INFO", f"跳过非硬件/许可证选项: {option_plan_code}", "purchase")
                     continue
-                filtered_hardware_options.append(option_plan_code)
-            
-            if filtered_hardware_options:
-                add_log("INFO", f"过滤后的硬件选项计划代码: {filtered_hardware_options}", "purchase")
+                filtered.append(option_plan_code)
+            if filtered:
+                add_log("INFO", f"过滤后的硬件选项计划代码: {filtered}", "purchase")
                 try:
                     add_log("INFO", f"获取购物车 {cart_id} 中与基础商品 {queue_item['planCode']} 兼容的 Eco 硬件选项...", "purchase")
                     available_eco_options = helper.get(f'/order/cart/{cart_id}/eco/options', planCode=queue_item['planCode'])
                     add_log("INFO", f"找到 {len(available_eco_options)} 个可用的 Eco 硬件选项。", "purchase")
+                    by_code = {opt.get("planCode"): opt for opt in available_eco_options if opt.get("planCode")}
                     added_options_count = 0
-                    for wanted_option_plan_code in filtered_hardware_options:
-                        option_added_successfully = False
-                        for avail_opt in available_eco_options:
-                            avail_opt_plan_code = avail_opt.get("planCode")
-                            if not avail_opt_plan_code:
-                                continue
-                            if avail_opt_plan_code == wanted_option_plan_code:
-                                add_log("INFO", f"找到匹配的 Eco 选项: {avail_opt_plan_code} (匹配用户请求: {wanted_option_plan_code})", "purchase")
-                                try:
-                                    option_payload_eco = {
-                                        "itemId": item_id, 
-                                        "planCode": avail_opt_plan_code, 
-                                        "duration": avail_opt.get("duration", "P1M"),
-                                        "pricingMode": avail_opt.get("pricingMode", "default"),
-                                        "quantity": 1
-                                    }
-                                    add_log("INFO", f"准备添加 Eco 选项: {option_payload_eco}", "purchase")
-                                    helper.post(f'/order/cart/{cart_id}/eco/options', **option_payload_eco)
-                                    add_log("INFO", f"成功添加 Eco 选项: {avail_opt_plan_code} 到购物车 {cart_id}", "purchase")
-                                    added_options_count += 1
-                                    option_added_successfully = True
-                                    break 
-                                except ovh.exceptions.APIError as add_opt_error:
-                                    add_log("WARNING", f"添加 Eco 选项 {avail_opt_plan_code} 失败: {add_opt_error}", "purchase")
-                                except Exception as general_add_opt_error:
-                                    add_log("WARNING", f"添加 Eco 选项 {avail_opt_plan_code} 时发生未知错误: {general_add_opt_error}", "purchase")
-                        if not option_added_successfully:
-                             add_log("WARNING", f"用户请求的硬件选项 {wanted_option_plan_code} 未在可用Eco选项中找到或添加失败。", "purchase")
+                    for wanted in list(dict.fromkeys(filtered)):
+                        opt = by_code.get(wanted)
+                        if not opt:
+                            add_log("WARNING", f"用户请求的硬件选项 {wanted} 未在可用Eco选项中找到或添加失败。", "purchase")
+                            continue
+                        try:
+                            payload_eco = {"itemId": item_id, "planCode": wanted, "duration": opt.get("duration", "P1M"), "pricingMode": opt.get("pricingMode", "default"), "quantity": 1}
+                            add_log("INFO", f"准备添加 Eco 选项: {payload_eco}", "purchase")
+                            helper.post(f'/order/cart/{cart_id}/eco/options', **payload_eco)
+                            add_log("INFO", f"成功添加 Eco 选项: {wanted} 到购物车 {cart_id}", "purchase")
+                            added_options_count += 1
+                        except ovh.exceptions.APIError as add_opt_error:
+                            add_log("WARNING", f"添加 Eco 选项 {wanted} 失败: {add_opt_error}", "purchase")
+                        except Exception as general_add_opt_error:
+                            add_log("WARNING", f"添加 Eco 选项 {wanted} 时发生未知错误: {general_add_opt_error}", "purchase")
                     add_log("INFO", f"共成功添加 {added_options_count} 个硬件选项。", "purchase")
                 except ovh.exceptions.APIError as get_opts_error:
                     add_log("ERROR", f"获取 Eco 硬件选项列表失败: {get_opts_error}", "purchase")
@@ -1161,135 +1181,173 @@ def purchase_server(queue_item):
         add_log("INFO", f"绑定购物车 {cart_id}", "purchase")
         helper.post(f'/order/cart/{cart_id}/assign')
         add_log("INFO", "购物车绑定成功", "purchase")
-        
-        # 获取购物车摘要以提取价格信息
-        price_info = None
+
+        price_info = None  # 购物车价格信息，仅用于日志和历史
         try:
             add_log("INFO", f"获取购物车 {cart_id} 摘要以提取价格信息", "purchase")
             cart_summary = helper.get(f'/order/cart/{cart_id}/summary')
-            
-            if cart_summary and isinstance(cart_summary, dict):
-                prices_field = cart_summary.get("prices")
-                if isinstance(prices_field, dict):
-                    with_tax_obj = prices_field.get("withTax")
-                    without_tax_obj = prices_field.get("withoutTax")
-                    tax_obj = prices_field.get("tax")
-                    
-                    # 提取货币代码
-                    currency_code = None
-                    if isinstance(with_tax_obj, dict):
-                        currency_code = with_tax_obj.get("currencyCode")
-                    if not currency_code:
-                        currency_code = prices_field.get("currencyCode", "EUR")
-                    
-                    # 安全提取价格值
-                    with_tax = None
-                    without_tax = None
-                    tax = None
-                    
-                    if with_tax_obj is not None:
-                        with_tax = with_tax_obj.get("value") if isinstance(with_tax_obj, dict) else with_tax_obj
-                    if without_tax_obj is not None:
-                        without_tax = without_tax_obj.get("value") if isinstance(without_tax_obj, dict) else without_tax_obj
-                    if tax_obj is not None:
-                        tax = tax_obj.get("value") if isinstance(tax_obj, dict) else tax_obj
-                    
-                    if with_tax is not None or without_tax is not None:
-                        price_info = {
-                            "withTax": with_tax,
-                            "withoutTax": without_tax,
-                            "tax": tax,
-                            "currencyCode": currency_code
-                        }
-                        add_log("INFO", f"成功提取价格信息: 含税={with_tax} {currency_code}, 不含税={without_tax} {currency_code}", "purchase")
+            price_info = _extract_price(cart_summary)
+            if price_info:
+                add_log("INFO", f"成功提取价格信息: 含税={price_info.get('withTax')} {price_info.get('currencyCode')}, 不含税={price_info.get('withoutTax')} {price_info.get('currencyCode')}", "purchase")
         except Exception as price_error:
             add_log("WARNING", f"获取价格信息时出错: {str(price_error)}，将继续结账流程", "purchase")
-        
-        add_log("INFO", f"对购物车 {cart_id} 执行结账，自动付款: {auto_pay}", "purchase")
-        checkout_payload = {
-            "autoPayWithPreferredPaymentMethod": auto_pay, 
-            "waiveRetractationPeriod": True
-        }
-        checkout_result = helper.post(f'/order/cart/{cart_id}/checkout', **checkout_payload)
-        
-        order_id_val = checkout_result.get("orderId", "")
-        order_url_val = checkout_result.get("url", "")
-        
-        # 记录单次成功：始终追加一条历史，不覆盖同任务的以往记录
-        current_time_iso = datetime.now().isoformat()
-        history_entry = {
-            "id": str(uuid.uuid4()),
-            "taskId": queue_item["id"],
-            "planCode": queue_item["planCode"],
-            "datacenter": selected_display_dc or (queue_item.get("datacenters") or [None])[0],
-            "options": queue_item.get("options", []),
-            "status": "success",
-            "orderId": order_id_val,
-            "orderUrl": order_url_val,
-            "errorMessage": None,
-            "purchaseTime": current_time_iso,
-            "attemptCount": queue_item["retryCount"],
-            "accountId": queue_item.get("accountId"),
-            "sequence": int(queue_item.get("purchased", 0)) + 1
-        }
-        if price_info:
-            history_entry["price"] = price_info
-        purchase_history.append(history_entry)
-        add_log("INFO", f"创建抢购历史(成功) 任务ID: {queue_item['id']}", "purchase")
-        
+
+        # 如果只需要购买1台或只有一个可售机房，则执行单次下单
+        # 仅当只需购买1台时使用单次模式；否则进入并发模式（即使只有一个机房也并发）
+        if remaining_to_buy <= 1:
+            add_log("INFO", f"单次下单模式（remaining={remaining_to_buy}, 可售机房={len(available_api_dcs)}）", "purchase")
+            add_log("INFO", f"对购物车 {cart_id} 执行结账，自动付款: {auto_pay}", "purchase")
+            checkout_payload = {"autoPayWithPreferredPaymentMethod": auto_pay, "waiveRetractationPeriod": True}
+            checkout_result = helper.post(f'/order/cart/{cart_id}/checkout', **checkout_payload)
+            order_id_val = checkout_result.get("orderId", "")
+            order_url_val = checkout_result.get("url", "")
+            _append_history(queue_item, "success", selected_display_dc or (queue_item.get("datacenters") or [None])[0], order_id_val, order_url_val, None, price_info)
+            add_log("INFO", f"创建抢购历史(成功) 任务ID: {queue_item['id']}", "purchase")
+            save_data()
+            update_stats()
+            add_log("INFO", f"成功购买 {queue_item['planCode']} 在 {selected_display_dc or first_dc} (订单ID: {order_id_val}, URL: {order_url_val})", "purchase")
+            if config.get("tgToken") and config.get("tgChatId"):
+                opt_list = queue_item.get("options", []) or []
+                options_text = ", ".join(opt_list) if opt_list else "默认配置"
+                account_alias = zone_cfg.get("alias") or "未知账户"
+                price_with_tax = price_info.get("withTax") if isinstance(price_info, dict) else None
+                price_without_tax = price_info.get("withoutTax") if isinstance(price_info, dict) else None
+                currency_code = price_info.get("currencyCode") if isinstance(price_info, dict) else None
+                msg = (
+                    f"🎉 下单成功！\n\n"
+                    f"账户: {account_alias}\n"
+                    f"服务器型号 (Plan Code): {queue_item['planCode']}\n"
+                    f"数据中心: {selected_display_dc or first_dc}\n"
+                    f"订单 ID: {order_id_val}\n"
+                    f"订单链接: {order_url_val}\n"
+                    f"自动支付: {'是' if auto_pay else '否'}\n"
+                    f"选项: {options_text}\n"
+                    f"价格(含税): {price_with_tax if price_with_tax is not None else 'N/A'} {currency_code or ''}\n"
+                    f"价格(不含税): {price_without_tax if price_without_tax is not None else 'N/A'} {currency_code or ''}\n"
+                    f"抢购任务ID: {queue_item['id']}"
+                )
+                send_telegram_msg(msg)
+                add_log("INFO", f"已为订单 {order_id_val} 发送 Telegram 成功通知。", "purchase")
+            else:
+                add_log("INFO", "未配置 Telegram Token 或 Chat ID，跳过成功通知发送。", "purchase")
+            return 1  # 返回成功数量
+
+        # 并发模式：按优先级机房平均分配线程，线程共享预读取的region/options/价格信息
+        add_log("INFO", f"并发下单模式：remaining={remaining_to_buy}, 可售机房={len(available_api_dcs)}，按优先级平均分配", "purchase")
+
+        # 预读取的数据供线程共用
+        shared_region = configurations_to_set.get("region")
+        shared_options_map = {}
+        try:
+            avail_opts = helper.get(f'/order/cart/{cart_id}/eco/options', planCode=queue_item['planCode'])
+            shared_options_map = {opt.get("planCode"): opt for opt in avail_opts if opt.get("planCode")}
+        except Exception:
+            pass
+
+        # 构建每台的机房分配序列（按优先顺序循环）
+        # 若未能计算出可售机房列表，优先使用已选中的机房进行并发
+        if not available_api_dcs:
+            available_api_dcs = [(selected_api_dc, selected_display_dc)]
+        dc_cycle = [dc for dc in available_api_dcs]  # 机房循环序列（保持优先顺序）
+        assignments = []
+        for i in range(remaining_to_buy):
+            api_dc, display_dc = dc_cycle[i % len(dc_cycle)]
+            assignments.append((api_dc, display_dc))
+
+        successes = 0
+        # 线程函数：在指定机房执行一次独立下单
+        def _purchase_one(api_dc, display_dc, seq_index):
+            # 在线程中执行一次独立下单：创建购物车、添加商品、设置配置、添加选项、绑定结账、记录历史
+            try:
+                # 创建线程独立购物车
+                cart_res = helper.post('/order/cart', ovhSubsidiary=zone_cfg["zone"])  # 每个线程单独创建购物车
+                c_id = cart_res.get("cartId")
+                # 添加基础商品
+                it_res = helper.post(f'/order/cart/{c_id}/eco', planCode=queue_item["planCode"], pricingMode="default", duration="P1M", quantity=1)
+                it_id = it_res.get("itemId")
+                # 配置必需项：机房、系统、区域（使用共享推断）
+                helper.post(f'/order/cart/{c_id}/item/{it_id}/configuration', label="dedicated_datacenter", value=str(api_dc))
+                helper.post(f'/order/cart/{c_id}/item/{it_id}/configuration', label="dedicated_os", value="none_64.en")
+                if shared_region:
+                    helper.post(f'/order/cart/{c_id}/item/{it_id}/configuration', label="region", value=str(shared_region))
+                # 添加硬件选项（使用共享可用选项表）
+                filtered_opts = queue_item.get("options", [])
+                for opt_code in list(dict.fromkeys(filtered_opts or [])):
+                    opt_meta = shared_options_map.get(opt_code)
+                    if not opt_meta:
+                        continue
+                    helper.post(f'/order/cart/{c_id}/eco/options', itemId=it_id, planCode=opt_code, duration=opt_meta.get("duration", "P1M"), pricingMode=opt_meta.get("pricingMode", "default"), quantity=1)
+                # 提取价格摘要（含税/不含税/币种）
+                price_info_thread = None
+                try:
+                    cart_summary_thread = helper.get(f'/order/cart/{c_id}/summary')
+                    price_info_thread = _extract_price(cart_summary_thread)
+                except Exception:
+                    pass
+                # 绑定并结账
+                helper.post(f'/order/cart/{c_id}/assign')
+                co_res = helper.post(f'/order/cart/{c_id}/checkout', autoPayWithPreferredPaymentMethod=auto_pay, waiveRetractationPeriod=True)
+                order_id = co_res.get("orderId", "")
+                order_url = co_res.get("url", "")
+                _append_history(queue_item, "success", display_dc, order_id, order_url, None, price_info_thread, sequence_idx=seq_index)
+                add_log("INFO", f"并发成功购买 {queue_item['planCode']} 在 {display_dc} (订单ID: {order_id})", "purchase")
+                # 可选通知（包含账户别名、机房显示+API代码、是否自动支付、选项、订单链接、任务ID）
+                if config.get("tgToken") and config.get("tgChatId"):
+                    options_list = queue_item.get("options", []) or []
+                    options_text = ", ".join(options_list) if options_list else "默认配置"
+                    account_alias = zone_cfg.get("alias") or "未知账户"
+                    order_url_text = co_res.get("url", "")
+                    price_with_tax = price_info_thread.get("withTax") if isinstance(price_info_thread, dict) else None
+                    price_without_tax = price_info_thread.get("withoutTax") if isinstance(price_info_thread, dict) else None
+                    currency_code = price_info_thread.get("currencyCode") if isinstance(price_info_thread, dict) else None
+                    msg = (
+                        f"🎉 下单成功！\n\n"
+                        f"账户: {account_alias}\n"
+                        f"服务器型号: {queue_item['planCode']}\n"
+                        f"数据中心: {display_dc}\n"
+                        f"订单ID: {order_id}\n"
+                        f"订单链接: {order_url_text}\n"
+                        f"自动支付: {'是' if auto_pay else '否'}\n"
+                        f"选项: {options_text}\n"
+                        f"价格(含税): {price_with_tax if price_with_tax is not None else 'N/A'} {currency_code or ''}\n"
+                        f"价格(不含税): {price_without_tax if price_without_tax is not None else 'N/A'} {currency_code or ''}\n"
+                        f"并发序号: {seq_index}/{remaining_to_buy}\n"
+                        f"任务ID: {queue_item['id']}"
+                    )
+                    send_telegram_msg(msg)
+                return True
+            except Exception as e:
+                err = str(e)
+                _append_history(queue_item, "failed", display_dc, None, None, err, None, sequence_idx=seq_index)
+                add_log("WARNING", f"并发下单失败 {queue_item['planCode']} @ {display_dc}: {err}", "purchase")
+                return False
+
+        # 并发执行：支持"单机房并发"（同一机房可同时跑多个线程）
+        # 如果任务中提供 maxConcurrent，则使用该值限制最大并发；否则默认允许最多 remaining_to_buy 个并发
+        user_max_concurrent = int(queue_item.get("maxConcurrent", remaining_to_buy)) if queue_item.get("maxConcurrent") is not None else remaining_to_buy
+        max_workers = max(1, min(remaining_to_buy, user_max_concurrent))
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [executor.submit(_purchase_one, api_dc, display_dc, i + 1) for i, (api_dc, display_dc) in enumerate(assignments)]
+            for fut in as_completed(futures):
+                if fut.result():
+                    successes += 1
+
+        # 汇总保存与统计更新（避免线程内频繁IO）
         save_data()
         update_stats()
-        
-        add_log("INFO", f"成功购买 {queue_item['planCode']} 在 {selected_display_dc or first_dc} (订单ID: {order_id_val}, URL: {order_url_val})", "purchase")
+        add_log("INFO", f"并发下单完成，总成功 {successes}/{remaining_to_buy}", "purchase")
+        return successes
 
-        # 发送 Telegram 成功通知
-        if config.get("tgToken") and config.get("tgChatId"):
-            success_message = (
-                f"🎉 OVH 服务器抢购成功！🎉\n\n"
-                f"服务器型号 (Plan Code): {queue_item['planCode']}\n"
-                f"数据中心: {selected_display_dc or first_dc}\n"
-                f"订单 ID: {order_id_val}\n"
-                f"订单链接: {order_url_val}\n"
-            )
-            options_list = queue_item.get("options", [])
-            if options_list:
-                options_str = ", ".join(options_list)
-                success_message += f"自定义配置: {options_str}\n"
-            
-            success_message += f"\n抢购任务ID: {queue_item['id']}"
-            
-            send_telegram_msg(success_message)
-            add_log("INFO", f"已为订单 {order_id_val} 发送 Telegram 成功通知。", "purchase")
-        else:
-            add_log("INFO", "未配置 Telegram Token 或 Chat ID，跳过成功通知发送。", "purchase")
-
-        return True
-    
     except ovh.exceptions.APIError as api_e:
         error_msg = str(api_e)
         add_log("ERROR", f"购买 {queue_item['planCode']} 时发生 OVH API 错误: {error_msg}", "purchase")
-        if cart_id: add_log("ERROR", f"错误发生时的购物车ID: {cart_id}", "purchase")
-        if item_id: add_log("ERROR", f"错误发生时的基础商品ID: {item_id}", "purchase")
-        
-        # 记录失败（API错误）：始终追加一条历史，不覆盖同任务的以往记录
-        current_time_iso = datetime.now().isoformat()
-        history_entry = {
-            "id": str(uuid.uuid4()),
-            "taskId": queue_item["id"],
-            "planCode": queue_item["planCode"],
-            "datacenter": (queue_item.get("datacenters") or [None])[0],
-            "options": queue_item.get("options", []),
-            "status": "failed",
-            "orderId": None,
-            "orderUrl": None,
-            "errorMessage": error_msg,
-            "purchaseTime": current_time_iso,
-            "attemptCount": queue_item["retryCount"],
-            "accountId": queue_item.get("accountId")
-        }
-        purchase_history.append(history_entry)
+        if cart_id:
+            add_log("ERROR", f"错误发生时的购物车ID: {cart_id}", "purchase")
+        if item_id:
+            add_log("ERROR", f"错误发生时的基础商品ID: {item_id}", "purchase")
+        _append_history(queue_item, "failed", (queue_item.get("datacenters") or [None])[0], None, None, error_msg, None)
         add_log("INFO", f"创建抢购历史(API失败) 任务ID: {queue_item['id']}", "purchase")
-
         save_data()
         update_stats()
         return False
@@ -1298,28 +1356,12 @@ def purchase_server(queue_item):
         error_msg = str(e)
         add_log("ERROR", f"购买 {queue_item['planCode']} 时发生未知错误: {error_msg}", "purchase")
         add_log("ERROR", f"完整错误堆栈: {traceback.format_exc()}", "purchase")
-        if cart_id: add_log("ERROR", f"错误发生时的购物车ID: {cart_id}", "purchase")
-        if item_id: add_log("ERROR", f"错误发生时的基础商品ID: {item_id}", "purchase")
-
-        # 记录失败（通用异常）：始终追加一条历史，不覆盖同任务的以往记录
-        current_time_iso = datetime.now().isoformat()
-        history_entry = {
-            "id": str(uuid.uuid4()),
-            "taskId": queue_item["id"],
-            "planCode": queue_item["planCode"],
-            "datacenter": (queue_item.get("datacenters") or [None])[0],
-            "options": queue_item.get("options", []),
-            "status": "failed",
-            "orderId": None,
-            "orderUrl": None,
-            "errorMessage": error_msg,
-            "purchaseTime": current_time_iso,
-            "attemptCount": queue_item["retryCount"],
-            "accountId": queue_item.get("accountId")
-        }
-        purchase_history.append(history_entry)
+        if cart_id:
+            add_log("ERROR", f"错误发生时的购物车ID: {cart_id}", "purchase")
+        if item_id:
+            add_log("ERROR", f"错误发生时的基础商品ID: {item_id}", "purchase")
+        _append_history(queue_item, "failed", (queue_item.get("datacenters") or [None])[0], None, None, error_msg, None)
         add_log("INFO", f"创建抢购历史(通用失败) 任务ID: {queue_item['id']}", "purchase")
-        
         save_data()
         update_stats()
         return False
@@ -1363,10 +1405,10 @@ def process_queue():
                 target_dcs_text = item.get('datacenter') or ','.join(item.get('datacenters') or [])
                 add_log("INFO", f"尝试任务 {item['id']}: {item['planCode']} 在 {target_dcs_text}", "queue")
             with sem:
-                ok = purchase_server(item)
+                successes = purchase_server(item)  # 支持并发购买，返回成功数量
             with queue_lock:
-                if ok:
-                    item["purchased"] = int(item.get("purchased", 0)) + 1
+                if successes:
+                    item["purchased"] = int(item.get("purchased", 0)) + int(successes)
                     item["failureCount"] = 0
                     if int(item.get("purchased", 0)) >= int(item.get("quantity", 1)):
                         item["status"] = "completed"
@@ -2888,7 +2930,7 @@ def update_queue_item(id):
     if not item:
         return jsonify({"status": "error", "error": "队列项不存在"}), 404
 
-    # 更新字段：planCode、datacenters、options、retryInterval
+    # 更新字段：planCode、datacenters、options、retryInterval、quantity、auto_pay
     if data.get("planCode"):
         item["planCode"] = data.get("planCode")
     if isinstance(data.get("datacenters"), list):
@@ -2903,6 +2945,8 @@ def update_queue_item(id):
         except Exception:
             q = 1
         item["quantity"] = max(1, min(q, 100))
+    if isinstance(data.get("auto_pay"), bool):
+        item["auto_pay"] = bool(data.get("auto_pay"))
     item["updatedAt"] = datetime.now().isoformat()
     # 编辑后重置计数，以便按新配置重新调度
     item["retryCount"] = 0
