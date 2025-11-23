@@ -3,6 +3,7 @@ services:
   ovh-app:
     image: iniwex/ovh:latest
     container_name: OVH
+    pull_policy: always
     ports:
       - "20000:80"
     environment:
@@ -10,7 +11,6 @@ services:
       - VITE_API_URL=/api
       - API_SECRET_KEY=你得替换为你自己的访问密钥
       - ENABLE_API_KEY_AUTH=true
-      - TZ=Asia/Shanghai
     volumes:
       - ./data:/app/backend/data
       - ./logs:/app/backend/logs
