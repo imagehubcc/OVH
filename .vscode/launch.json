@@ -1,0 +1,40 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Backend: Flask (app.py)",
+      "type": "python",
+      "request": "launch",
+      "program": "${workspaceFolder}/backend/app.py",
+      "cwd": "${workspaceFolder}",
+      "envFile": "${workspaceFolder}/backend/.env",
+      "console": "integratedTerminal",
+      "justMyCode": true
+    },
+    {
+      "name": "Frontend: Vite dev server",
+      "type": "pwa-node",
+      "request": "launch",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": [
+        "run",
+        "dev"
+      ],
+      "cwd": "${workspaceFolder}",
+      "env": {
+        "NODE_ENV": "development"
+      },
+      "console": "integratedTerminal",
+      
+    }
+  ],
+  "compounds": [
+    {
+      "name": "Dev: Backend + Frontend",
+      "configurations": [
+        "Backend: Flask (app.py)",
+        "Frontend: Vite dev server"
+      ]
+    }
+  ]
+}
