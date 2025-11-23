@@ -22,7 +22,8 @@ FROM python:3.11-slim
 WORKDIR /app
 
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends nginx gcc ca-certificates && \
+    apt-get install -y --no-install-recommends nginx gcc ca-certificates tzdata && \
+    ln -snf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime && echo Asia/Shanghai > /etc/timezone && \
     rm -rf /var/lib/apt/lists/*
 
 COPY backend/requirements.txt /app/backend/requirements.txt
@@ -45,5 +46,6 @@ EXPOSE 80
 
 ENV PYTHONUNBUFFERED=1
 ENV PORT=19998
+ENV TZ=Asia/Shanghai
 
 CMD ["/start.sh"]

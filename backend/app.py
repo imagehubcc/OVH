@@ -2,6 +2,7 @@ import os
 import time
 import json
 import logging
+from logging.handlers import TimedRotatingFileHandler
 import uuid
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -42,7 +43,13 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler(os.path.join(LOGS_DIR, "app.log"), encoding='utf-8'),
+        TimedRotatingFileHandler(
+            os.path.join(LOGS_DIR, "app.log"),
+            when='midnight',
+            interval=1,
+            backupCount=14,
+            encoding='utf-8'
+        ),
         logging.StreamHandler()
     ]
 )

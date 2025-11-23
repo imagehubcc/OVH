@@ -8,8 +8,9 @@ services:
     environment:
       - DEBUG=false
       - VITE_API_URL=/api
-      - API_SECRET_KEY=你得替换为你自己的密钥
+      - API_SECRET_KEY=你得替换为你自己的访问密钥
       - ENABLE_API_KEY_AUTH=true
+      - TZ=Asia/Shanghai
     volumes:
       - ./data:/app/backend/data
       - ./logs:/app/backend/logs
