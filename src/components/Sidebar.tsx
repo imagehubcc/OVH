@@ -181,14 +181,24 @@ const Sidebar = ({ onToggle, isOpen }: SidebarProps) => {
       <div className="border-t border-cyber-accent/20 p-4 bg-cyber-bg/30">
         <div className="space-y-3">
           <div className="text-xs">
-            <div className={`flex items-center ${isAuthenticated ? 'text-green-400' : 'text-cyber-muted'}`}>
-              <span className={`w-2 h-2 rounded-full mr-2 ${isAuthenticated ? 'bg-green-400 animate-pulse' : 'bg-red-400'}`}></span>
-              <span>{isAuthenticated ? 'API已连接' : 'API未连接'}</span>
+            <div className="flex items-center justify-between">
+              <div className={`flex items-center ${isAuthenticated ? 'text-green-400' : 'text-cyber-muted'}`}>
+                <span className={`w-2 h-2 rounded-full mr-2 ${isAuthenticated ? 'bg-green-400 animate-pulse' : 'bg-red-400'}`}></span>
+                <span>{isAuthenticated ? 'API已连接' : 'API未连接'}</span>
+              </div>
+              <div className="flex items-center gap-2">
+                {currentZone && (
+                  <span className="px-2 py-0.5 text-[10px] rounded-md bg-cyber-accent/15 text-cyber-accent border border-cyber-accent/30">
+                    {currentZone}
+                  </span>
+                )}
+                <span className="text-cyber-muted text-xs">{`v${__APP_VERSION__}${__APP_BUILD_CHANNEL__ && __APP_BUILD_CHANNEL__ !== 'release' ? `-${__APP_BUILD_CHANNEL__}` : ''}`}</span>
+              </div>
             </div>
           </div>
-          <div className="flex items-center justify-between">
+          <div>
             <select
-              className="text-xs bg-cyber-bg/50 border border-cyber-accent/30 rounded px-2 py-1 text-cyber-text"
+              className="w-full text-xs bg-cyber-bg/50 border border-cyber-accent/30 rounded px-2 py-1 text-cyber-text"
               value={currentAccountId || ''}
               onChange={(e) => setCurrentAccount(e.target.value)}
             >
@@ -196,12 +206,6 @@ const Sidebar = ({ onToggle, isOpen }: SidebarProps) => {
                 <option key={acc.id} value={acc.id}>{acc.alias || acc.id}</option>
               ))}
             </select>
-            {currentZone && (
-              <span className="ml-2 px-2 py-0.5 text-[10px] rounded-md bg-cyber-accent/15 text-cyber-accent border border-cyber-accent/30">
-                {currentZone}
-              </span>
-            )}
-            <div className="text-cyber-muted text-xs">{`v${__APP_VERSION__}${__APP_BUILD_CHANNEL__ && __APP_BUILD_CHANNEL__ !== 'release' ? `-${__APP_BUILD_CHANNEL__}` : ''}`}</div>
           </div>
         </div>
       </div>

@@ -3410,6 +3410,35 @@ def telegram_webhook():
                             options = cached_config.get("options", [])
                             
                             add_log("INFO", f"✅ 从UUID缓存恢复配置: UUID={message_uuid}, {plan_code}@{datacenter}, options={options}", "telegram")
+                            acc_list = list(accounts.keys())
+                            if len(acc_list) > 1:
+                                tg_token = config.get("tgToken")
+                                if tg_token:
+                                    answer_url = f"https://api.telegram.org/bot{tg_token}/answerCallbackQuery"
+                                    requests.post(answer_url, json={
+                                        "callback_query_id": callback_query.get("id"),
+                                        "text": "请选择账户",
+                                        "show_alert": False
+                                    }, timeout=5)
+                                    monitor.message_uuid_cache[message_uuid]["accountIds"] = acc_list
+                                    inline_keyboard = []
+                                    row = []
+                                    for idx, aid in enumerate(acc_list):
+                                        alias = (accounts.get(aid) or {}).get("alias") or aid
+                                        data_obj = {"a": "order_with_account", "u": message_uuid, "i": idx}
+                                        data_str = json.dumps(data_obj, ensure_ascii=False, separators=(',', ':'))
+                                        row.append({"text": str(alias), "callback_data": data_str[:64]})
+                                        if len(row) >= 2 or idx == len(acc_list) - 1:
+                                            inline_keyboard.append(row)
+                                            row = []
+                                    send_url = f"https://api.telegram.org/bot{tg_token}/sendMessage"
+                                    requests.post(send_url, json={
+                                        "chat_id": chat_id,
+                                        "text": f"请选择账户进行下单\n型号: {plan_code}\n机房: {datacenter.upper()}",
+                                        "reply_markup": {"inline_keyboard": inline_keyboard},
+                                        "reply_to_message_id": message_id
+                                    }, timeout=10)
+                                return jsonify({"ok": True})
                             
                             # 添加到抢购队列（使用数组形式机房）
                             queue_item = {
@@ -3423,8 +3452,8 @@ def telegram_webhook():
                                 "retryInterval": 30,
                                 "retryCount": 0,
                                 "lastCheckTime": 0,
-                                "fromTelegram": True,  # 标记来自Telegram
-                                "accountId": get_account_id_from_request()
+                                "fromTelegram": True,
+                                "accountId": (acc_list[0] if acc_list else get_account_id_from_request())
                             }
                             
                             queue.append(queue_item)
@@ -3539,6 +3568,57 @@ def telegram_webhook():
                         "reply_to_message_id": message_id
                     }, timeout=5)
                 
+                return jsonify({"ok": True})
+            elif action == "order_with_account":
+                message_uuid = callback_data_obj.get("u") or callback_data_obj.get("uuid")
+                idx = callback_data_obj.get("i")
+                try:
+                    idx = int(idx)
+                except Exception:
+                    idx = 0
+                if not (message_uuid and monitor and hasattr(monitor, 'message_uuid_cache')):
+                    return jsonify({"ok": False, "error": "Missing uuid"}), 400
+                cached_config = monitor.message_uuid_cache.get(message_uuid, {})
+                plan_code = cached_config.get("planCode")
+                datacenter = cached_config.get("datacenter")
+                options = cached_config.get("options", [])
+                acc_ids = cached_config.get("accountIds") or list(accounts.keys())
+                if idx < 0 or idx >= len(acc_ids):
+                    idx = 0
+                chosen_account = acc_ids[idx] if acc_ids else get_account_id_from_request()
+                queue_item = {
+                    "id": str(uuid.uuid4()),
+                    "planCode": plan_code,
+                    "datacenters": [datacenter] if datacenter else [],
+                    "options": options,
+                    "status": "running",
+                    "createdAt": datetime.now().isoformat(),
+                    "updatedAt": datetime.now().isoformat(),
+                    "retryInterval": 30,
+                    "retryCount": 0,
+                    "lastCheckTime": 0,
+                    "fromTelegram": True,
+                    "accountId": chosen_account
+                }
+                queue.append(queue_item)
+                save_data()
+                update_stats()
+                tg_token = config.get("tgToken")
+                if tg_token:
+                    answer_url = f"https://api.telegram.org/bot{tg_token}/answerCallbackQuery"
+                    requests.post(answer_url, json={
+                        "callback_query_id": callback_query.get("id"),
+                        "text": "已添加到队列！",
+                        "show_alert": False
+                    }, timeout=5)
+                    send_url = f"https://api.telegram.org/bot{tg_token}/sendMessage"
+                    options_str = ", ".join(options) if options else "无（默认配置）"
+                    requests.post(send_url, json={
+                        "chat_id": chat_id,
+                        "text": f"✅ 已添加到抢购队列！\n\n型号: {plan_code}\n机房: {datacenter.upper()}\n配置: {options_str}\n账户: {chosen_account}",
+                        "reply_to_message_id": message_id
+                    }, timeout=10)
+                add_log("INFO", f"Telegram选择账户下单: {plan_code}@{datacenter}, 账户: {chosen_account}", "telegram")
                 return jsonify({"ok": True})
             
             else:
