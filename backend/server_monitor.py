@@ -30,7 +30,7 @@ class ServerMonitor:
         self.subscriptions = []  # 订阅列表
         self.known_servers = set()  # 已知服务器集合
         self.running = False  # 运行状态
-        self.check_interval = 5  # 检查间隔（秒），默认5秒
+        self.check_interval = 20
         self.thread = None
         self.account_id = account_id
         
@@ -146,7 +146,7 @@ class ServerMonitor:
         
         try:
             # 获取当前可用性（支持配置级别）
-            current_availability = self.check_availability(plan_code)
+            current_availability = self.check_availability(plan_code, self.account_id)
             if not current_availability:
                 self.add_log("WARNING", f"无法获取 {plan_code} 的可用性信息", "monitor")
                 return
@@ -1222,7 +1222,8 @@ class ServerMonitor:
             payload = {
                 "plan_code": plan_code,
                 "datacenter": datacenter,
-                "options": options
+                "options": options,
+                "accountId": self.account_id
             }
             
             try:
@@ -1397,8 +1398,10 @@ class ServerMonitor:
         }
     
     def set_check_interval(self, interval):
-        """设置检查间隔（秒）- 已禁用，全局固定为5秒"""
-        # 检查间隔全局固定为5秒，不允许修改
-        self.check_interval = 5
-        self.add_log("INFO", "检查间隔已全局固定为5秒，无法修改", "monitor")
+        try:
+            v = int(interval)
+        except Exception:
+            v = 20
+        self.check_interval = max(1, v)
+        self.add_log("INFO", f"检查间隔已设置为: {self.check_interval}秒", "monitor")
         return True

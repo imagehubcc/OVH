@@ -111,6 +111,11 @@ const SettingsPage = () => {
       return;
     }
 
+    if (!webhookUrl.startsWith('https://')) {
+      toast.error('Webhook URL 必须为 HTTPS，例如：https://your-domain.com');
+      return;
+    }
+
     setIsSettingWebhook(true);
     try {
       const response = await api.post('/telegram/set-webhook', {

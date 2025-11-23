@@ -1,6 +1,7 @@
 import os
 import time
 import json
+import base64
 import logging
 from logging.handlers import TimedRotatingFileHandler
 import uuid
@@ -15,6 +16,11 @@ from ovh.exceptions import APIError as OvhAPIError
 import re
 import traceback
 import requests
+from telegram_utils import parse_callback_data as tg_parse_callback_data
+from telegram_utils import tg_post as tg_post_util
+from telegram_utils import tg_answer_callback as tg_answer
+from telegram_utils import tg_send_message as tg_send
+from telegram_utils import processed_callback_ids
 from dotenv import load_dotenv
 
 # 加载 .env 文件
@@ -247,45 +253,15 @@ def load_data():
                             )
                     if 'known_servers' in subscriptions_data:
                         mon.known_servers = set(subscriptions_data['known_servers'])
-                    mon.check_interval = 5
-                    print(f"检查间隔已强制设置为: 5秒（全局固定值）")
+                    mon.check_interval = subscriptions_data.get('check_interval', 20)
+                    print(f"检查间隔设置为: {mon.check_interval}秒（来自subscriptions.json）")
                     print(f"已加载 {len(mon.subscriptions)} 个订阅")
                 else:
                     print(f"警告: {SUBSCRIPTIONS_FILE}文件为空")
         except json.JSONDecodeError:
             print(f"警告: {SUBSCRIPTIONS_FILE}文件格式不正确")
 
-    # 加载各账户订阅分片
-    try:
-        for aid in accounts.keys():
-            path = os.path.join(DATA_DIR, f"subscriptions_{aid}.json")
-            if not os.path.exists(path):
-                continue
-            with open(path, 'r', encoding='utf-8') as f:
-                content = f.read().strip()
-                if not content:
-                    continue
-                subscriptions_data = json.loads(content)
-                mon = get_monitor_for_account(aid)
-                if 'subscriptions' in subscriptions_data:
-                    for sub in subscriptions_data['subscriptions']:
-                        mon.add_subscription(
-                            sub['planCode'],
-                            sub.get('datacenters', []),
-                            sub.get('notifyAvailable', True),
-                            sub.get('notifyUnavailable', False),
-                            sub.get('serverName'),
-                            sub.get('lastStatus', {}),
-                            sub.get('history', []),
-                            sub.get('autoOrder', False),
-                            sub.get('autoOrderQuantity', 0)
-                        )
-                if 'known_servers' in subscriptions_data:
-                    mon.known_servers = set(subscriptions_data['known_servers'])
-                mon.check_interval = 5
-                print(f"账户 {aid} 已加载 {len(mon.subscriptions)} 个订阅")
-    except Exception as e:
-        print(f"警告: 加载账户订阅分片失败: {e}")
+    # 订阅配置不区分账户，仅使用全局 subscriptions.json
 
     # 加载各账户队列分片
     try:
@@ -642,6 +618,12 @@ def get_account_id_from_request():
         except Exception:
             aid = None
     return aid
+
+def _parse_callback_data(callback_query):
+    return tg_parse_callback_data(callback_query)
+
+def _tg_post(url, payload, timeout=5):
+    return tg_post_util(url, payload, timeout)
 
 def get_current_account_config(account_id=None):
     aid = account_id or get_account_id_from_request()
@@ -2580,33 +2562,26 @@ def init_monitor():
     return monitor
 
 def get_monitor_for_account(account_id=None):
-    aid = account_id
-    if not aid:
-        try:
-            aid = next(iter(accounts.keys())) if accounts else None
-        except Exception:
-            aid = None
-    if aid not in monitors:
-        monitors[aid] = ServerMonitor(
+    global monitor
+    if not monitor:
+        monitor = ServerMonitor(
             check_availability_func=check_server_availability_with_configs,
             send_notification_func=send_telegram_msg,
             add_log_func=add_log,
-            account_id=aid
+            account_id=None
         )
-    return monitors[aid]
+    return monitor
 
 # 保存订阅数据
 def save_subscriptions(account_id=None):
     try:
         mon = get_monitor_for_account(account_id)
-        mon.check_interval = 5
         subscriptions_data = {
             "subscriptions": mon.subscriptions,
             "known_servers": list(mon.known_servers),
-            "check_interval": 5
+            "check_interval": mon.check_interval or 20
         }
-        path = SUBSCRIPTIONS_FILE if not account_id else os.path.join(DATA_DIR, f"subscriptions_{account_id}.json")
-        with open(path, 'w', encoding='utf-8') as f:
+        with open(SUBSCRIPTIONS_FILE, 'w', encoding='utf-8') as f:
             json.dump(subscriptions_data, f, ensure_ascii=False, indent=2)
         add_log("INFO", "订阅数据已保存", "monitor")
     except Exception as e:
@@ -3236,9 +3211,9 @@ def set_telegram_webhook():
         if not webhook_url:
             return jsonify({"success": False, "error": "缺少 webhook_url 参数"}), 400
         
-        # 验证 URL 格式
-        if not webhook_url.startswith("http://") and not webhook_url.startswith("https://"):
-            return jsonify({"success": False, "error": "Webhook URL 必须以 http:// 或 https:// 开头"}), 400
+        # 验证 URL 格式与 HTTPS 要求（Telegram 官方要求 Webhook 使用 HTTPS）
+        if not webhook_url.startswith("https://"):
+            return jsonify({"success": False, "error": "Webhook URL 必须为 HTTPS，示例：https://your-domain.com"}), 400
         
         # 确保 URL 指向正确的端点
         if not webhook_url.endswith("/api/telegram/webhook"):
@@ -3253,6 +3228,9 @@ def set_telegram_webhook():
         # 调用 Telegram API 设置 webhook
         set_url = f"https://api.telegram.org/bot{tg_token}/setWebhook"
         params = {"url": webhook_url}
+        # 可选：降低错误影响，关闭不必要的选项
+        # Telegram 要求有效的 TLS 证书，若为自签名或内网域名将失败
+        # 这里不设置 `allowed_updates` 或 `secret_token`，保持默认
         
         try:
             response = requests.post(set_url, params=params, timeout=10)
@@ -3356,37 +3334,21 @@ def telegram_webhook():
             user_id = from_user.get("id")
             
             add_log("INFO", f"收到Telegram回调: user_id={user_id}, callback_data={callback_data[:50]}...", "telegram")
-            
-            # 解析callback_data（可能是JSON或base64编码的）
-            import base64
-            import json
-            
+            cbid = callback_query.get("id")
+            if cbid and cbid in processed_callback_ids:
+                return jsonify({"ok": True})
             try:
-                # 检查是否是base64编码
-                if callback_data.startswith("b64:"):
-                    # 提取base64部分并解码
-                    base64_part = callback_data[4:]  # 去掉 "b64:" 前缀
-                    try:
-                        # base64解码可能会因为截断而失败，需要添加padding
-                        # base64字符串长度必须是4的倍数，不足的用'='补足
-                        missing_padding = len(base64_part) % 4
-                        if missing_padding:
-                            base64_part += '=' * (4 - missing_padding)
-                        callback_data_decoded = base64.b64decode(base64_part).decode('utf-8')
-                        callback_data_obj = json.loads(callback_data_decoded)
-                    except (base64.binascii.Error, UnicodeDecodeError, json.JSONDecodeError) as decode_error:
-                        add_log("WARNING", f"base64解码失败（可能是数据被截断）: {str(decode_error)}, base64_len={len(callback_data[4:])}", "telegram")
-                        # 如果解码失败，尝试从部分数据中提取关键信息
-                        # 这通常意味着数据在传输过程中被截断
-                        add_log("WARNING", f"callback_data（前100字符）: {callback_data[:100]}", "telegram")
-                        return jsonify({"ok": False, "error": "Callback data decoding failed (possibly truncated)"}), 400
-                else:
-                    callback_data_obj = json.loads(callback_data)
-            except json.JSONDecodeError as e:
-                add_log("ERROR", f"解析callback_data JSON失败: {str(e)}, data={callback_data[:100]}", "telegram")
-                return jsonify({"ok": False, "error": "Invalid callback data format"}), 400
+                callback_data_obj = _parse_callback_data(callback_query)
             except Exception as e:
-                add_log("ERROR", f"解析callback_data时发生未知错误: {str(e)}, data={callback_data[:100]}", "telegram")
+                add_log("ERROR", f"解析callback_data失败: {str(e)}, data={callback_data[:100]}", "telegram")
+                # 直接答复 callback，避免客户端卡住
+                tg_token = config.get("tgToken")
+                if tg_token:
+                    _tg_post(f"https://api.telegram.org/bot{tg_token}/answerCallbackQuery", {
+                        "callback_query_id": callback_query.get("id"),
+                        "text": "按钮数据异常，请重试",
+                        "show_alert": False
+                    })
                 return jsonify({"ok": False, "error": "Invalid callback data"}), 400
             
             # 支持短字段名（a, p, d, o）和长字段名（action, planCode, datacenter, options）
@@ -3415,29 +3377,29 @@ def telegram_webhook():
                                 tg_token = config.get("tgToken")
                                 if tg_token:
                                     answer_url = f"https://api.telegram.org/bot{tg_token}/answerCallbackQuery"
-                                    requests.post(answer_url, json={
+                                    _tg_post(answer_url, {
                                         "callback_query_id": callback_query.get("id"),
                                         "text": "请选择账户",
                                         "show_alert": False
-                                    }, timeout=5)
+                                    })
                                     monitor.message_uuid_cache[message_uuid]["accountIds"] = acc_list
                                     inline_keyboard = []
                                     row = []
                                     for idx, aid in enumerate(acc_list):
                                         alias = (accounts.get(aid) or {}).get("alias") or aid
-                                        data_obj = {"a": "order_with_account", "u": message_uuid, "i": idx}
+                                        data_obj = {"a": "owa", "u": message_uuid, "i": idx}
                                         data_str = json.dumps(data_obj, ensure_ascii=False, separators=(',', ':'))
-                                        row.append({"text": str(alias), "callback_data": data_str[:64]})
+                                        row.append({"text": str(alias), "callback_data": data_str})
                                         if len(row) >= 2 or idx == len(acc_list) - 1:
                                             inline_keyboard.append(row)
                                             row = []
                                     send_url = f"https://api.telegram.org/bot{tg_token}/sendMessage"
-                                    requests.post(send_url, json={
+                                    _tg_post(send_url, {
                                         "chat_id": chat_id,
                                         "text": f"请选择账户进行下单\n型号: {plan_code}\n机房: {datacenter.upper()}",
                                         "reply_markup": {"inline_keyboard": inline_keyboard},
                                         "reply_to_message_id": message_id
-                                    }, timeout=10)
+                                    }, 10)
                                 return jsonify({"ok": True})
                             
                             # 添加到抢购队列（使用数组形式机房）
@@ -3471,18 +3433,18 @@ def telegram_webhook():
                                 send_url = f"https://api.telegram.org/bot{tg_token}/sendMessage"
                                 
                                 # 先回答callback（显示loading提示）
-                                requests.post(answer_url, json={
+                                _tg_post(answer_url, {
                                     "callback_query_id": callback_query.get("id"),
                                     "text": "已添加到队列！",
                                     "show_alert": False
-                                }, timeout=5)
+                                })
                                 
                                 # 发送确认消息
-                                requests.post(send_url, json={
+                                _tg_post(send_url, {
                                     "chat_id": chat_id,
                                     "text": confirm_message,
                                     "reply_to_message_id": message_id
-                                }, timeout=5)
+                                })
                             
                             return jsonify({"ok": True})
                         else:
@@ -3555,11 +3517,11 @@ def telegram_webhook():
                     send_url = f"https://api.telegram.org/bot{tg_token}/sendMessage"
                     
                     # 先回答callback（显示loading提示）
-                    requests.post(answer_url, json={
+                    _tg_post(answer_url, {
                         "callback_query_id": callback_query.get("id"),
                         "text": "已添加到队列！",
                         "show_alert": False
-                    }, timeout=5)
+                    })
                     
                     # 发送确认消息
                     requests.post(send_url, json={
@@ -3569,7 +3531,7 @@ def telegram_webhook():
                     }, timeout=5)
                 
                 return jsonify({"ok": True})
-            elif action == "order_with_account":
+            elif action in ("order_with_account", "owa"):
                 message_uuid = callback_data_obj.get("u") or callback_data_obj.get("uuid")
                 idx = callback_data_obj.get("i")
                 try:
@@ -3586,6 +3548,63 @@ def telegram_webhook():
                 if idx < 0 or idx >= len(acc_ids):
                     idx = 0
                 chosen_account = acc_ids[idx] if acc_ids else get_account_id_from_request()
+                account_alias = (accounts.get(chosen_account) or {}).get("alias") or chosen_account
+                monitor.message_uuid_cache[message_uuid]["chosenAccount"] = chosen_account
+                short_uuid = (message_uuid or "").replace('-', '')
+                try:
+                    monitor.message_uuid_cache[short_uuid] = monitor.message_uuid_cache[message_uuid]
+                except Exception:
+                    pass
+                tg_token = config.get("tgToken")
+                if tg_token:
+                    answer_url = f"https://api.telegram.org/bot{tg_token}/answerCallbackQuery"
+                    _tg_post(answer_url, {
+                        "callback_query_id": callback_query.get("id"),
+                        "text": "请选择数量与是否自动支付",
+                        "show_alert": False
+                    })
+                    inline_keyboard = []
+                    labels_pay = {0: "不自动支付", 1: "自动支付"}
+                    for q in [1, 2, 3]:
+                        row = []
+                        for p in [0, 1]:
+                            data_obj = {"a": "owc", "u": short_uuid, "q": q, "p": p}
+                            data_str = json.dumps(data_obj, ensure_ascii=False, separators=(',', ':'))
+                            row.append({"text": f"数量 {q} | {labels_pay[p]}", "callback_data": data_str})
+                        inline_keyboard.append(row)
+                    send_url = f"https://api.telegram.org/bot{tg_token}/sendMessage"
+                    resp = _tg_post(send_url, {
+                        "chat_id": chat_id,
+                        "text": f"账户: {account_alias}\n型号: {plan_code}\n机房: {datacenter.upper()}\n请选择下单数量与是否自动支付：",
+                        "reply_markup": {"inline_keyboard": inline_keyboard},
+                        "reply_to_message_id": message_id
+                    }, 10)
+                    try:
+                        if not resp or not getattr(resp, 'ok', False):
+                            add_log("WARNING", "发送数量/自动支付选项失败", "telegram")
+                    except Exception:
+                        pass
+                if cbid:
+                    processed_callback_ids.add(cbid)
+                return jsonify({"ok": True})
+            
+            elif action == "owc":
+                message_uuid = callback_data_obj.get("u") or callback_data_obj.get("uuid")
+                q = callback_data_obj.get("q")
+                p = callback_data_obj.get("p")
+                try:
+                    q = int(q)
+                except Exception:
+                    q = 1
+                auto_pay = bool(int(p)) if isinstance(p, (int, str)) else False
+                if not (message_uuid and monitor and hasattr(monitor, 'message_uuid_cache')):
+                    return jsonify({"ok": False, "error": "Missing uuid"}), 400
+                cached_config = monitor.message_uuid_cache.get(message_uuid, {})
+                plan_code = cached_config.get("planCode")
+                datacenter = cached_config.get("datacenter")
+                options = cached_config.get("options", [])
+                chosen_account = cached_config.get("chosenAccount") or get_account_id_from_request()
+                account_alias = (accounts.get(chosen_account) or {}).get("alias") or chosen_account
                 queue_item = {
                     "id": str(uuid.uuid4()),
                     "planCode": plan_code,
@@ -3598,7 +3617,9 @@ def telegram_webhook():
                     "retryCount": 0,
                     "lastCheckTime": 0,
                     "fromTelegram": True,
-                    "accountId": chosen_account
+                    "accountId": chosen_account,
+                    "quantity": max(1, min(q, 100)),
+                    "auto_pay": auto_pay
                 }
                 queue.append(queue_item)
                 save_data()
@@ -3606,21 +3627,20 @@ def telegram_webhook():
                 tg_token = config.get("tgToken")
                 if tg_token:
                     answer_url = f"https://api.telegram.org/bot{tg_token}/answerCallbackQuery"
-                    requests.post(answer_url, json={
+                    _tg_post(answer_url, {
                         "callback_query_id": callback_query.get("id"),
                         "text": "已添加到队列！",
                         "show_alert": False
-                    }, timeout=5)
+                    })
                     send_url = f"https://api.telegram.org/bot{tg_token}/sendMessage"
                     options_str = ", ".join(options) if options else "无（默认配置）"
-                    requests.post(send_url, json={
+                    _tg_post(send_url, {
                         "chat_id": chat_id,
-                        "text": f"✅ 已添加到抢购队列！\n\n型号: {plan_code}\n机房: {datacenter.upper()}\n配置: {options_str}\n账户: {chosen_account}",
+                        "text": f"✅ 已添加到抢购队列！\n\n型号: {plan_code}\n机房: {datacenter.upper()}\n配置: {options_str}\n数量: {queue_item['quantity']}\n自动支付: {'是' if auto_pay else '否'}\n账户: {account_alias}",
                         "reply_to_message_id": message_id
-                    }, timeout=10)
-                add_log("INFO", f"Telegram选择账户下单: {plan_code}@{datacenter}, 账户: {chosen_account}", "telegram")
+                    }, 10)
+                add_log("INFO", f"Telegram确认下单: {plan_code}@{datacenter}, 数量: {queue_item['quantity']}, 自动支付: {'是' if auto_pay else '否'}, 账户: {account_alias}", "telegram")
                 return jsonify({"ok": True})
-            
             else:
                 add_log("WARNING", f"未知的action: {action}", "telegram")
                 return jsonify({"ok": False, "error": f"Unknown action: {action}"}), 400
@@ -9539,10 +9559,6 @@ def delete_account(account_id):
                 mon = monitors.pop(account_id)
                 if mon and mon.running:
                     mon.stop()
-            # 删除订阅分片文件
-            sub_path = os.path.join(DATA_DIR, f"subscriptions_{account_id}.json")
-            if os.path.exists(sub_path):
-                os.remove(sub_path)
             # 清理该账户相关的队列项
             to_delete = [item for item in queue if item.get("accountId") == account_id]
             for item in to_delete:
@@ -9654,10 +9670,9 @@ if __name__ == '__main__':
     # Load data first (会加载订阅数据)
     load_data()
     
-    # 检查间隔全局强制为5秒（无任何条件判断）
-    monitor.check_interval = 5
+    monitor.check_interval = 20
     save_subscriptions()
-    print(f"监控检查间隔已强制设置为: 5秒（全局固定值）")
+    print(f"监控检查间隔初始化为: {monitor.check_interval}秒")
     
     # 只在主进程启动后台线程（避免Flask reloader重复启动）
     # 使用环境变量判断是否为主进程
@@ -9681,8 +9696,7 @@ if __name__ == '__main__':
         print("跳过后台线程启动（等待主进程）")
     
     # 自动启动服务器监控（如果有订阅）
-    # 检查间隔全局强制为5秒
-    monitor.check_interval = 5
+    monitor.check_interval = monitor.check_interval or 20
     
     if len(monitor.subscriptions) > 0:
         monitor.start()
