@@ -126,6 +126,7 @@ server_list_cache = {
 
 # 自动刷新缓存的后台线程标志
 auto_refresh_running = False
+last_selected_account_id = None
 
 # 初始化监控器（需要在函数定义后才能传入函数引用）
 monitor = None
@@ -607,6 +608,7 @@ def get_api_base_url_for(endpoint):
     return endpoint_urls.get(endpoint or 'ovh-eu', 'https://eu.api.ovh.com')
 
 def get_account_id_from_request():
+    global last_selected_account_id
     try:
         aid = request.headers.get('X-OVH-Account')
     except Exception:
@@ -618,6 +620,8 @@ def get_account_id_from_request():
                 aid = body.get('accountId')
         except Exception:
             aid = None
+    if aid:
+        last_selected_account_id = aid
     return aid
 
 def _parse_callback_data(callback_query):
@@ -1468,29 +1472,43 @@ def auto_refresh_cache_loop():
     while auto_refresh_running:
         try:
             # 每2小时刷新一次
-            time.sleep(2 * 60 * 60)  # 2小时
-            
-            # 检查是否配置了API
-            if not get_ovh_client():
-                add_log("WARNING", "未配置API，跳过自动刷新", "auto_refresh")
-                continue
-            
-            add_log("INFO", "开始自动刷新服务器列表...", "auto_refresh")
-            
-            # 从API加载服务器列表
-            api_servers = load_server_list()
-            
-            if api_servers and len(api_servers) > 0:
-                # 更新缓存和全局变量
-                server_plans = api_servers
-                server_list_cache["data"] = api_servers
-                server_list_cache["timestamp"] = time.time()
-                save_data()
-                update_stats()
-                
-                add_log("INFO", f"自动刷新完成：已更新 {len(server_plans)} 台服务器", "auto_refresh")
-            else:
-                add_log("WARNING", "自动刷新失败：API返回空数据", "auto_refresh")
+            time.sleep(2 * 60 * 60)
+
+            # 优先使用当前选择账户，失败则遍历其他账户重试
+            preferred = last_selected_account_id
+            all_accounts = list(accounts.keys())
+            candidates = []
+            if preferred and preferred in accounts:
+                candidates.append(preferred)
+            for aid in all_accounts:
+                if aid != preferred:
+                    candidates.append(aid)
+            if not candidates:
+                candidates = [None]
+
+            add_log("INFO", f"开始自动刷新服务器列表（候选账户: {len(candidates)}）", "auto_refresh")
+
+            refreshed = False
+            for aid in candidates:
+                try:
+                    api_servers = load_server_list(aid)
+                    if api_servers and len(api_servers) > 0:
+                        server_plans = api_servers
+                        server_list_cache["data"] = api_servers
+                        server_list_cache["timestamp"] = time.time()
+                        save_data()
+                        update_stats()
+                        alias = (accounts.get(aid, {}) or {}).get('alias') if aid else 'global'
+                        add_log("INFO", f"自动刷新完成：账户 {aid or 'global'} ({alias}) 更新 {len(server_plans)} 台服务器", "auto_refresh")
+                        refreshed = True
+                        break
+                    else:
+                        add_log("WARNING", f"账户 {aid or 'global'} 自动刷新失败：API返回空数据", "auto_refresh")
+                except Exception as e:
+                    add_log("WARNING", f"账户 {aid or 'global'} 自动刷新异常: {str(e)}", "auto_refresh")
+
+            if not refreshed:
+                add_log("ERROR", "自动刷新失败：所有候选账户均未成功", "auto_refresh")
                 
         except Exception as e:
             add_log("ERROR", f"自动刷新缓存时出错: {str(e)}", "auto_refresh")
@@ -1511,16 +1529,16 @@ def start_auto_refresh_cache():
     thread.start()
     add_log("INFO", "自动刷新缓存线程已启动", "auto_refresh")
 # Load server list from OVH API
-def load_server_list():
+def load_server_list(account_id=None):
     
-    client = get_ovh_client()
+    client = get_ovh_client(account_id)
     if not client:
         return []
     
     try:
         # 保存完整的API原始响应
         try:
-            zone_cfg = get_current_account_config()
+            zone_cfg = get_current_account_config(account_id)
             catalog = client.get(f"/order/catalog/public/eco?ovhSubsidiary={zone_cfg['zone']}")
             with open(os.path.join(CACHE_DIR, "ovh_catalog_raw.json"), "w", encoding='utf-8') as f:
                 json.dump(catalog, f, ensure_ascii=False, indent=2)
@@ -1529,7 +1547,7 @@ def load_server_list():
             add_log("WARNING", f"保存API原始响应时出错: {str(e)}")
         
         # Get server models
-        zone_cfg = get_current_account_config()
+        zone_cfg = get_current_account_config(account_id)
         catalog = client.get(f"/order/catalog/public/eco?ovhSubsidiary={zone_cfg['zone']}")
         plans = []
         
@@ -4490,8 +4508,13 @@ def get_cache_info():
     
     # 检查缓存是否有效
     if server_list_cache["timestamp"]:
-        cache_age = time.time() - server_list_cache["timestamp"]
+        now_ts = time.time()
+        cache_age = now_ts - server_list_cache["timestamp"]
         cache_info["backend"]["cacheValid"] = cache_age < server_list_cache["cache_duration"]
+        next_refresh = server_list_cache["timestamp"] + server_list_cache["cache_duration"]
+        refresh_remaining = max(0, int(next_refresh - now_ts))
+        cache_info["backend"]["nextAutoRefresh"] = int(next_refresh)
+        cache_info["backend"]["refreshRemaining"] = refresh_remaining
     
     return jsonify(cache_info)
 

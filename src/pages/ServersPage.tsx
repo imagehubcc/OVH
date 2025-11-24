@@ -224,17 +224,28 @@ const ServersPage = () => {
         });
       }
       
-      // 先尝试读取后端缓存（共享于所有账户）
-      let response = await api.get(`/servers`, {
-        params: { 
-          showApiServers: false,
-          forceRefresh: false 
-        }
-      });
+      let response;
+      if (forceRefresh && authState) {
+        response = await api.get(`/servers`, {
+          params: {
+            showApiServers: true,
+            forceRefresh: true
+          }
+        });
+      } else {
+        response = await api.get(`/servers`, {
+          params: { 
+            showApiServers: false,
+            forceRefresh: false 
+          }
+        });
+      }
       
       // 调试输出查看原始服务器数据
       console.log("原始服务器数据:", response.data);
-      
+
+      let serversList: ServerPlan[] = [];
+
       // 检查是否使用了过期缓存
       if (response.data?.cacheInfo?.usingExpiredCache) {
         const ageMinutes = response.data.cacheInfo.cacheAgeMinutes;
@@ -245,10 +256,32 @@ const ServersPage = () => {
           duration: 5000,
         });
         console.warn(`使用过期缓存数据（${ageText}前）`);
+
+        if (authState && forceRefresh) {
+          try {
+            const realtimeResp = await api.get(`/servers`, {
+              params: {
+                showApiServers: true,
+                forceRefresh: true
+              }
+            });
+            if (realtimeResp.data && typeof realtimeResp.data === 'object') {
+              if (Array.isArray(realtimeResp.data)) {
+                serversList = realtimeResp.data as any;
+              } else if (realtimeResp.data.servers && Array.isArray(realtimeResp.data.servers)) {
+                serversList = realtimeResp.data.servers as any;
+              }
+            }
+            if (serversList && serversList.length > 0) {
+              toast.success('服务器列表已从 OVH 更新');
+            }
+          } catch (e) {
+            console.warn('后台重试实时获取失败');
+          }
+        }
       }
       
       // 确保我们从正确的数据结构中获取服务器列表
-      let serversList = [];
       
       if (response.data && typeof response.data === 'object') {
         if (Array.isArray(response.data)) {
@@ -268,7 +301,6 @@ const ServersPage = () => {
         return;
       }
       
-      // 若缓存为空且已认证，则回退到实时拉取
       if ((!serversList || serversList.length === 0) && authState) {
         if (!hasLoadedFromCache.current && !fetchToastShownRef.current) {
           fetchToastShownRef.current = true;

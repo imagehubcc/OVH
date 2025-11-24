@@ -51,6 +51,15 @@ export const CacheManager = () => {
     }
   };
 
+  const formatRemaining = (sec: number | undefined): string => {
+    if (sec === undefined) return "未知";
+    const hours = Math.floor(sec / 3600);
+    const minutes = Math.floor((sec % 3600) / 60);
+    if (hours > 0) return `${hours}小时${minutes}分钟`;
+    if (minutes > 0) return `${minutes}分钟`;
+    return "即将刷新";
+  };
+
   // 获取缓存信息
   const fetchCacheInfo = async () => {
     // 检查是否有 API 密钥
@@ -199,6 +208,9 @@ export const CacheManager = () => {
                       {Math.floor(cacheInfo.backend.cacheDuration / 3600)} 小时
                       <span className="text-[10px] text-muted-foreground ml-2">
                         ({cacheInfo.backend.cacheDuration / 60} 分钟)
+                      </span>
+                      <span className="text-[10px] text-muted-foreground ml-2">
+                        剩余刷新：{formatRemaining((cacheInfo as any)?.backend?.refreshRemaining)}
                       </span>
                     </p>
                   </div>
