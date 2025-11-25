@@ -69,6 +69,8 @@ const DATACENTER_REGIONS: Record<string, string[]> = {
 const QueuePage = () => {
   const isMobile = useIsMobile();
   const { isAuthenticated, accounts } = useAPI();
+  const [selectedAccountId, setSelectedAccountId] = useState<string>('');
+  const [scopeAll, setScopeAll] = useState<boolean>(false);
   const [queueItems, setQueueItems] = useState<QueueItem[]>([]);
   const [isLoading, setIsLoading] = useState(true);
   const [isRefreshing, setIsRefreshing] = useState(false); // 区分初始加载和刷新
@@ -117,7 +119,7 @@ const QueuePage = () => {
   };
 
   // Fetch queue items
-  const fetchQueueItems = async (isRefresh = false) => {
+  const fetchQueueItems = async (isRefresh = false, scopeOverride?: boolean) => {
     // 如果是刷新，只设置刷新状态，不改变加载状态
     if (isRefresh) {
       setIsRefreshing(true);
@@ -125,12 +127,14 @@ const QueuePage = () => {
       setIsLoading(true);
     }
     try {
-      const response = await api.get(`/queue`);
+      const useScopeAll = scopeOverride !== undefined ? scopeOverride : scopeAll;
+      const response = await api.get(`/queue`, { params: { scope: useScopeAll ? 'all' : undefined } });
       setQueueItems(response.data);
       try {
-        const runningResp = await api.get(`/queue/paged`, { params: { status: 'running', page: runningPage, pageSize } });
-        const completedResp = await api.get(`/queue/paged`, { params: { status: 'completed', page: completedPage, pageSize } });
-        const pausedResp = await api.get(`/queue/paged`, { params: { status: 'paused', page: pausedPage, pageSize } });
+        const baseParams = (extra: any = {}) => ({ scope: useScopeAll ? 'all' : undefined, ...extra });
+        const runningResp = await api.get(`/queue/paged`, { params: baseParams({ status: 'running', page: runningPage, pageSize }) });
+        const completedResp = await api.get(`/queue/paged`, { params: baseParams({ status: 'completed', page: completedPage, pageSize }) });
+        const pausedResp = await api.get(`/queue/paged`, { params: baseParams({ status: 'paused', page: pausedPage, pageSize }) });
         setRunningItems(runningResp.data.items || []);
         setCompletedItems(completedResp.data.items || []);
         setPausedItems(pausedResp.data.items || []);
@@ -205,6 +209,7 @@ const QueuePage = () => {
         options: selectedOptions,
         quantity: quantity,
         auto_pay: autoPay,
+        accountId: selectedAccountId || undefined,
       });
       toast.success(`已创建抢购任务，目标 ${quantity} 台`);
       fetchQueueItems(true);
@@ -225,6 +230,7 @@ const QueuePage = () => {
     setShowAddForm(true);
     setEditingItemId(item.id);
     setPlanCodeInput(item.planCode || '');
+    setSelectedAccountId(item.accountId || '');
     setRetryInterval(item.retryInterval || TASK_RETRY_INTERVAL);
     setQuantity(Math.min(Math.max(item.quantity || 1, 1), 100));
     setSelectedOptions(Array.isArray(item.options) ? item.options : []);
@@ -256,6 +262,7 @@ const QueuePage = () => {
         options: selectedOptions,
         quantity,
         auto_pay: autoPay,
+        accountId: selectedAccountId || undefined,
       });
       toast.success('队列已更新');
       setEditingItemId(null);
@@ -315,8 +322,13 @@ const QueuePage = () => {
   // Clear all queue items
   const clearAllQueue = async () => {
     try {
-      const response = await api.delete(`/queue/clear`);
-      toast.success(`已清空队列（共 ${response.data.count} 项）`);
+      const response = await api.delete(`/queue/clear`, { params: { scope: scopeAll ? 'all' : undefined } });
+      const cnt = response.data?.count ?? 0;
+      const accCnt = response.data?.accountCount ?? (scopeAll ? '多个' : 1);
+      toast.success(scopeAll 
+        ? `已清空全部账户队列（共 ${cnt} 项，涉及 ${accCnt} 个账户）`
+        : `已清空当前账户队列（共 ${cnt} 项）`
+      );
       fetchQueueItems(true);
       setShowClearConfirm(false);
     } catch (error) {
@@ -332,42 +344,41 @@ const QueuePage = () => {
     (async () => {
       await fetchServers(false);
     })();
-    const interval = setInterval(fetchQueueItems, QUEUE_POLLING_INTERVAL);
-    return () => clearInterval(interval);
+    return () => void 0;
   }, []);
 
   useEffect(() => {
     (async () => {
       try {
-        const runningResp = await api.get(`/queue/paged`, { params: { status: 'running', page: runningPage, pageSize } });
+        const runningResp = await api.get(`/queue/paged`, { params: { status: 'running', page: runningPage, pageSize, scope: scopeAll ? 'all' : undefined } });
         setRunningItems(runningResp.data.items || []);
         setRunningTotal(runningResp.data.total || 0);
         setRunningTotalPages(runningResp.data.totalPages || 1);
       } catch {}
     })();
-  }, [runningPage, pageSize]);
+  }, [runningPage, pageSize, scopeAll]);
 
   useEffect(() => {
     (async () => {
       try {
-        const completedResp = await api.get(`/queue/paged`, { params: { status: 'completed', page: completedPage, pageSize } });
+        const completedResp = await api.get(`/queue/paged`, { params: { status: 'completed', page: completedPage, pageSize, scope: scopeAll ? 'all' : undefined } });
         setCompletedItems(completedResp.data.items || []);
         setCompletedTotal(completedResp.data.total || 0);
         setCompletedTotalPages(completedResp.data.totalPages || 1);
       } catch {}
     })();
-  }, [completedPage, pageSize]);
+  }, [completedPage, pageSize, scopeAll]);
 
   useEffect(() => {
     (async () => {
       try {
-        const pausedResp = await api.get(`/queue/paged`, { params: { status: 'paused', page: pausedPage, pageSize } });
+        const pausedResp = await api.get(`/queue/paged`, { params: { status: 'paused', page: pausedPage, pageSize, scope: scopeAll ? 'all' : undefined } });
         setPausedItems(pausedResp.data.items || []);
         setPausedTotal(pausedResp.data.total || 0);
         setPausedTotalPages(pausedResp.data.totalPages || 1);
       } catch {}
     })();
-  }, [pausedPage, pageSize]);
+  }, [pausedPage, pageSize, scopeAll]);
 
   useEffect(() => {
     const t = setTimeout(() => {
@@ -670,6 +681,19 @@ const QueuePage = () => {
             <h2 className={`${isMobile ? 'text-lg' : 'text-xl'} font-semibold text-cyber-primary-accent`}>
               {editingItemId ? '正在编辑队列项' : '添加抢购任务'}
             </h2>
+            <div className="flex items-center gap-2">
+              <select
+                value={selectedAccountId}
+                onChange={(e) => setSelectedAccountId(e.target.value)}
+                className="text-xs px-2 py-1 rounded border border-cyber-border bg-cyber-grid/10"
+                title="选择账户"
+              >
+                <option value="">当前账户</option>
+                {accounts.map((a: any) => (
+                  <option key={a.id} value={a.id}>{a.alias || a.id}</option>
+                ))}
+              </select>
+            </div>
           </div>
           
           <div className="space-y-4 sm:space-y-6 mb-4 sm:mb-6">
@@ -942,6 +966,27 @@ const QueuePage = () => {
                   <TabsTrigger value="completed" className="data-[state=active]:bg-cyber-accent/20">已完成</TabsTrigger>
                 </TabsList>
               </Tabs>
+              <div className="mt-2 flex items-center justify-end">
+                <div
+                  className="relative inline-flex items-center bg-cyber-grid/10 border border-cyber-border rounded-full h-8 px-3"
+                  role="group"
+                  aria-label="查看范围切换"
+                >
+                  <button
+                    className={`relative z-10 text-[11px] px-4 py-1.5 leading-none rounded-full transition-colors ${!scopeAll ? 'text-cyber-bg' : 'text-cyber-text'}`}
+                    onClick={() => { if (scopeAll) { setScopeAll(false); fetchQueueItems(true, false); } }}
+                    title="只看当前账户"
+                  >当前账户</button>
+                  <button
+                    className={`relative z-10 text-[11px] px-4 py-1.5 leading-none rounded-full transition-colors ${scopeAll ? 'text-cyber-bg' : 'text-cyber-text'}`}
+                    onClick={() => { if (!scopeAll) { setScopeAll(true); fetchQueueItems(true, true); } }}
+                    title="查看全部账户"
+                  >全部账户</button>
+                  <span
+                    className={`absolute top-1 bottom-1 left-1 transition-all duration-200 rounded-full bg-cyber-accent ${scopeAll ? 'translate-x-[84px] w-[88px]' : 'translate-x-0 w-[88px]'}`}
+                  />
+                </div>
+              </div>
             </div>
             {activeTab === 'running' && (
             <Card className="cyber-card">
@@ -1319,7 +1364,7 @@ const QueuePage = () => {
                 >
                   <h3 className="text-xl font-bold text-cyber-text mb-2">⚠️ 确认清空</h3>
                   <p className="text-cyber-muted mb-6 whitespace-pre-line">
-                    确定要清空所有队列任务吗？{'\n'}
+                    {scopeAll ? '确定要清空全部账户的队列任务吗？' : '确定要清空当前账户的队列任务吗？'}{'\n'}
                     <span className="text-red-400 text-sm">此操作不可撤销。</span>
                   </p>
                   <div className="flex gap-3 justify-end">

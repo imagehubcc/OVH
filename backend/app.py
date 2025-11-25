@@ -2712,20 +2712,14 @@ def clear_logs():
 
 @app.route('/api/queue', methods=['GET'])
 def get_queue():
+    scope = (request.args.get('scope') or '').lower()
     account_id = get_account_id_from_request()
-    if account_id:
-        items = [item for item in queue if item.get("accountId") == account_id]
-        seen = set()
-        dedup = []
-        for it in items:
-            iid = it.get("id")
-            if iid and iid not in seen:
-                seen.add(iid)
-                dedup.append(it)
-        return jsonify(dedup)
+    items_src = queue
+    if scope != 'all' and account_id:
+        items_src = [item for item in items_src if item.get("accountId") == account_id]
     seen = set()
     dedup = []
-    for it in queue:
+    for it in items_src:
         iid = it.get("id")
         if iid and iid not in seen:
             seen.add(iid)
@@ -2748,9 +2742,10 @@ def get_queue_paged():
         page = max(1, page)
         page_size = max(1, min(page_size, 100))
 
+        scope = (request.args.get('scope') or '').lower()
         account_id = get_account_id_from_request()
         items_src = queue
-        if account_id:
+        if scope != 'all' and account_id:
             items_src = [item for item in items_src if item.get('accountId') == account_id]
 
         # 去重
@@ -2834,7 +2829,7 @@ def add_queue_item():
         "retryInterval": data.get("retryInterval", 30),
         "retryCount": 0, # 初始化为0, process_queue的首次检查会处理
         "lastCheckTime": 0, # 初始化为0, process_queue的首次检查会处理
-        "accountId": account_id
+        "accountId": data.get("accountId") or account_id
     }
     
     queue.append(queue_item)
@@ -2864,8 +2859,9 @@ def remove_queue_item(id):
 @app.route('/api/queue/clear', methods=['DELETE'])
 def clear_all_queue():
     global queue, deleted_task_ids
+    scope = (request.args.get('scope') or '').lower()
     account_id = get_account_id_from_request()
-    if account_id:
+    if scope != 'all' and account_id:
         to_delete = [item for item in queue if item.get("accountId") == account_id]
         for item in to_delete:
             deleted_task_ids.add(item["id"])
@@ -2881,9 +2877,11 @@ def clear_all_queue():
             add_log("ERROR", f"清空队列分片文件时出错: {str(e)}")
         update_stats()
         add_log("INFO", f"Cleared account queue items ({count} items removed)")
-        return jsonify({"status": "success", "count": count})
+        return jsonify({"status": "success", "count": count, "accountCount": 1})
     else:
         count = len(queue)
+        accounts_set = set([it.get("accountId") for it in queue if it.get("accountId")])
+        account_count = len(accounts_set) if accounts_set else 0
         for item in queue:
             deleted_task_ids.add(item["id"])
         add_log("INFO", f"标记 {count} 个任务为删除，后台线程将立即停止处理")
@@ -2897,7 +2895,7 @@ def clear_all_queue():
             add_log("ERROR", f"清空队列文件时出错: {str(e)}")
         update_stats()
         add_log("INFO", f"Cleared all queue items ({count} items removed)")
-        return jsonify({"status": "success", "count": count})
+        return jsonify({"status": "success", "count": count, "accountCount": account_count})
 
 @app.route('/api/queue/<id>/status', methods=['PUT'])
 def update_queue_status(id):
@@ -2937,7 +2935,7 @@ def update_queue_item(id):
     if not item:
         return jsonify({"status": "error", "error": "队列项不存在"}), 404
 
-    # 更新字段：planCode、datacenters、options、retryInterval、quantity、auto_pay
+    # 更新字段：planCode、datacenters、options、retryInterval、quantity、auto_pay、accountId
     if data.get("planCode"):
         item["planCode"] = data.get("planCode")
     if isinstance(data.get("datacenters"), list):
@@ -2954,6 +2952,8 @@ def update_queue_item(id):
         item["quantity"] = max(1, min(q, 100))
     if isinstance(data.get("auto_pay"), bool):
         item["auto_pay"] = bool(data.get("auto_pay"))
+    if data.get("accountId"):
+        item["accountId"] = data.get("accountId")
     item["updatedAt"] = datetime.now().isoformat()
     # 编辑后重置计数，以便按新配置重新调度
     item["retryCount"] = 0
@@ -2969,7 +2969,10 @@ def update_queue_item(id):
 
 @app.route('/api/purchase-history', methods=['GET'])
 def get_purchase_history():
+    scope = (request.args.get('scope') or '').lower()
     account_id = get_account_id_from_request()
+    if scope == 'all':
+        return jsonify(purchase_history)
     if account_id:
         items = [h for h in purchase_history if h.get("accountId") == account_id]
         return jsonify(items)

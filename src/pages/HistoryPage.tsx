@@ -31,6 +31,7 @@ const HistoryPage = () => {
   const isMobile = useIsMobile();
   const { showConfirm } = useToast();
   const { accounts } = useAPI();
+  const [scopeAll, setScopeAll] = useState<boolean>(false);
   const [history, setHistory] = useState<PurchaseHistory[]>([]);
   const [isLoading, setIsLoading] = useState(true);
   const [isRefreshing, setIsRefreshing] = useState(false); // 区分初始加载和刷新
@@ -46,7 +47,7 @@ const HistoryPage = () => {
   };
 
   // Fetch purchase history
-  const fetchHistory = async (isRefresh = false) => {
+  const fetchHistory = async (isRefresh = false, scopeOverride?: boolean) => {
     // 如果是刷新，只设置刷新状态，不改变加载状态
     if (isRefresh) {
       setIsRefreshing(true);
@@ -54,7 +55,8 @@ const HistoryPage = () => {
       setIsLoading(true);
     }
     try {
-      const response = await api.get(`/purchase-history`);
+      const useScopeAll = scopeOverride !== undefined ? scopeOverride : scopeAll;
+      const response = await api.get(`/purchase-history`, { params: { scope: useScopeAll ? 'all' : undefined } });
       setHistory(response.data);
       setFilteredHistory(response.data);
     } catch (error) {
@@ -126,8 +128,31 @@ const HistoryPage = () => {
         animate={{ opacity: 1, y: 0 }}
         transition={{ duration: 0.3 }}
       >
-        <h1 className="text-3xl font-bold mb-1 cyber-glow-text">抢购历史</h1>
-        <p className="text-cyber-muted mb-6">查看服务器购买历史记录</p>
+        <div>
+          <h1 className="text-3xl font-bold mb-1 cyber-glow-text">抢购历史</h1>
+          <p className="text-cyber-muted">查看服务器购买历史记录</p>
+          <div className="mt-2">
+            <div
+              className="relative inline-flex items-center bg-cyber-grid/10 border border-cyber-border rounded-full h-8 px-3"
+              role="group"
+              aria-label="查看范围切换"
+            >
+              <button
+                className={`relative z-10 text-[11px] px-4 py-1.5 leading-none rounded-full transition-colors ${!scopeAll ? 'text-cyber-bg' : 'text-cyber-text'}`}
+                onClick={() => { if (scopeAll) { setScopeAll(false); fetchHistory(true, false); } }}
+                title="只看当前账户"
+              >当前账户</button>
+              <button
+                className={`relative z-10 text-[11px] px-4 py-1.5 leading-none rounded-full transition-colors ${scopeAll ? 'text-cyber-bg' : 'text-cyber-text'}`}
+                onClick={() => { if (!scopeAll) { setScopeAll(true); fetchHistory(true, true); } }}
+                title="查看全部账户"
+              >全部账户</button>
+              <span
+                className={`absolute top-1 bottom-1 left-1 transition-all duration-200 rounded-full bg-cyber-accent ${scopeAll ? 'translate-x-[84px] w-[88px]' : 'translate-x-0 w-[88px]'}`}
+              />
+            </div>
+          </div>
+        </div>
       </motion.div>
 
       {/* Filters and controls */}
